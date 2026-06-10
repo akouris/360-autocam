@@ -4,6 +4,12 @@ Turns a 360° Insta360 video of a panel discussion, podcast, or roundtable into 
 
 Place the camera on the table. Everyone sits around it. The pipeline figures out who is where, who is speaking, and produces a final video that stays on the active speaker while cutting to split-screens and cycling through reactions — no manual editing required.
 
+## Demo
+
+[![360-autocam demo — watch on YouTube](https://i.ytimg.com/vi/F0w0of0BS8k/hqdefault.jpg)](https://www.youtube.com/watch?v=F0w0of0BS8k)
+
+▶ **[Watch the demo](https://www.youtube.com/watch?v=F0w0of0BS8k)** — a 360° recording auto-cut into a 9:16 vertical with speaker switching.
+
 ---
 
 ## What you get
