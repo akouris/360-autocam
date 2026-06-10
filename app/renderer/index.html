@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" />
+  <title>360 AutoCam</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Title bar ─────────────────────────────────────────────────────── -->
+  <div id="titlebar">
+    <span id="app-title">360 AutoCam</span>
+    <div id="hw-badge">
+      <span class="hw-chip" id="hw-cpu">—</span>
+      <span class="hw-chip" id="hw-ram">—</span>
+      <span class="hw-chip good" id="hw-vt">VideoToolbox ✓</span>
+      <span class="hw-chip" id="hw-est">—</span>
+    </div>
+  </div>
+
+  <!-- ── Main layout ───────────────────────────────────────────────────── -->
+  <div id="main">
+
+    <!-- Sidebar: inputs -->
+    <div id="sidebar">
+
+      <div>
+        <div class="section-label">Video Source</div>
+        <div class="mode-toggle" id="mode-toggle">
+          <button class="mode-btn active" data-mode="fisheye">Insta360</button>
+          <button class="mode-btn"        data-mode="equirect">YouTube 360°</button>
+        </div>
+      </div>
+
+      <div>
+        <div class="section-label">360° Video</div>
+        <div class="drop-zone" id="dz-video" tabindex="0">
+          <span class="dz-icon">📹</span>
+          <span class="dz-hint" id="dz-video-hint">Click or drop .insv / .mp4</span>
+        </div>
+      </div>
+
+      <div>
+        <div class="section-label">External Mic Audio <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></div>
+        <div class="drop-zone" id="dz-audio" tabindex="0">
+          <span class="dz-icon">🎙</span>
+          <span class="dz-hint">Click or drop .mp3 / .wav</span>
+        </div>
+      </div>
+
+      <div>
+        <div class="section-label">Hugging Face Token</div>
+        <input type="password" class="token-input" id="hf-token"
+               placeholder="hf_xxxxxxxxxxxx" autocomplete="off" spellcheck="false" />
+        <div class="token-hint">Required for speaker diarization. Get one at huggingface.co/settings/tokens and accept pyannote model terms.</div>
+      </div>
+
+    </div>
+
+    <!-- Right: steps + log -->
+    <div id="content">
+
+      <div id="steps-area">
+        <h3>Pipeline</h3>
+        <div id="steps-list">
+          <!-- populated by JS -->
+        </div>
+        <!-- Fixed progress strip — always visible while running -->
+        <div id="progress-strip" class="hidden">
+          <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
+          <div id="progress-label"></div>
+        </div>
+      </div>
+
+      <div id="log-area" class="collapsed">
+        <div id="log-header">
+          <span>▸</span>
+          <span>Output Log</span>
+          <button id="btn-copy-log" style="-webkit-app-region:no-drag;margin-left:auto;margin-right:8px;background:none;border:none;color:var(--text-dimmer);font-size:11px;cursor:pointer;padding:0" title="Copy log">⎘ Copy</button>
+          <span id="log-toggle">▾ expand</span>
+        </div>
+        <div id="log-scroll"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Actions ────────────────────────────────────────────────────────── -->
+  <div id="actions">
+    <button class="btn btn-primary"    id="btn-run">▶ Run Pipeline</button>
+    <button class="btn btn-danger"     id="btn-stop" disabled>■ Stop</button>
+    <label  id="preview-toggle" title="Render only the first 60 seconds as a quick check">
+      <input type="checkbox" id="preview-mode"> 60s preview
+    </label>
+    <span   id="status-text"></span>
+    <button class="btn btn-secondary"  id="btn-open">↗ Open Output</button>
+  </div>
+
+</div>
+
+<!-- ── Resume confirmation overlay ──────────────────────────────────────── -->
+<div id="resume-overlay" class="hidden">
+  <div id="resume-card">
+    <h2>Existing job found</h2>
+    <p id="resume-desc"></p>
+    <div id="resume-countdown-wrap">Auto-resuming in <span id="resume-countdown">60</span>s</div>
+    <div id="resume-bar-track"><div id="resume-bar-fill"></div></div>
+    <div id="resume-actions">
+      <button class="btn btn-danger"   id="btn-resume-fresh">↺ Start Fresh (all steps)</button>
+      <button class="btn btn-primary"  id="btn-resume-now">▶ Resume Now</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── First-time setup overlay ─────────────────────────────────────────── -->
+<div id="setup-overlay" class="hidden">
+  <div id="setup-card">
+    <h2>First-time Setup</h2>
+    <p>Installing Python dependencies (pyannote, torch, mediapipe…).<br>
+       This takes 5–15 minutes and only runs once.</p>
+    <div id="setup-log"></div>
+    <div id="setup-progress" class="setup-progress-indeterminate">
+      <div id="setup-progress-bar"></div>
+    </div>
+    <button class="btn btn-primary" id="btn-setup-start" style="width:100%">Install Dependencies</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

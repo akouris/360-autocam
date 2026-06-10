@@ -1,0 +1,35 @@
+# secrets
+.env
+
+# generated runtime dirs
+venv/
+frames/
+output/
+autocam_*/
+
+# pipeline artifacts + downloaded model (all of data/ is generated; the
+# face_landmarker.task model is downloaded during setup — see README)
+data/
+
+# media (inputs/outputs should never be committed)
+*.insv
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.m4a
+*.aac
+
+# local scratch / dev demo (hardcoded local paths)
+test_splitscreen.py
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Electron / Node
+app/node_modules/
+app/dist/
+app/package-lock.json

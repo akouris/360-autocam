@@ -1,0 +1,48 @@
+{
+  "name": "360autocam",
+  "version": "1.0.0",
+  "description": "Auto-cut 360° Insta360 video into 9:16 vertical with speaker switching",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.akouris.360autocam",
+    "productName": "360 AutoCam",
+    "mac": {
+      "category": "public.app-category.video",
+      "icon": "resources/icon.icns",
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] }
+      ],
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "title": "360 AutoCam",
+      "window": { "width": 540, "height": 380 }
+    },
+    "extraResources": [
+      { "from": "../0_extract_audio.py",   "to": "scripts/0_extract_audio.py"   },
+      { "from": "../1_extract_frames.py",  "to": "scripts/1_extract_frames.py"  },
+      { "from": "../2_detect_speakers.py", "to": "scripts/2_detect_speakers.py" },
+      { "from": "../2b_detect_presence.py","to": "scripts/2b_detect_presence.py"},
+      { "from": "../3_diarize.py",         "to": "scripts/3_diarize.py"         },
+      { "from": "../3_automap.py",         "to": "scripts/3_automap.py"         },
+      { "from": "../4_render.py",          "to": "scripts/4_render.py"          },
+      { "from": "../5_sync_audio.py",      "to": "scripts/5_sync_audio.py"      },
+      { "from": "resources/requirements.txt", "to": "requirements.txt"          }
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^28.3.0",
+    "electron-builder": "^24.13.3"
+  }
+}
