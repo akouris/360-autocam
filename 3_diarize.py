@@ -168,8 +168,11 @@ if __name__ == "__main__":
                         help="Trim audio to this many seconds before diarizing (preview mode)")
     args = parser.parse_args()
 
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
+    hf_token = os.environ.get("HF_TOKEN") or None
+    # The packaged app ships the pyannote weights (PYANNOTE_CACHE + HF_HUB_OFFLINE=1),
+    # so no token is needed there. Only a from-source run must download them.
+    offline = os.environ.get("HF_HUB_OFFLINE") == "1"
+    if not hf_token and not offline:
         print("Error: HF_TOKEN environment variable not set.")
         print("Get a token at https://huggingface.co/settings/tokens")
         print("Then accept model terms at https://huggingface.co/pyannote/speaker-diarization-3.1")

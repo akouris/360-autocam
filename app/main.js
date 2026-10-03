@@ -18,10 +18,23 @@ const REQS       = IS_PKG
   ? path.join(process.resourcesPath, 'requirements.txt')
   : path.join(__dirname, 'resources', 'requirements.txt')
 
-// Prefer the project venv when running in dev (already has all packages).
-// Fall back to the app-managed venv in userData for packaged distribution.
+// Self-contained runtime (built by build/bundle.sh): Python + packages, ffmpeg,
+// and all models ship inside the app, so it runs on a Mac with nothing installed.
+// Packaged: Contents/Resources/{python,bin,models}. Dev: app/bundle if built.
+const BUNDLE_DIR = IS_PKG ? process.resourcesPath : path.join(__dirname, 'bundle')
+const BUNDLED = {
+  python: path.join(BUNDLE_DIR, 'python', 'bin', 'python3'),
+  bin:    path.join(BUNDLE_DIR, 'bin'),
+  ffmpeg: path.join(BUNDLE_DIR, 'bin', 'ffmpeg'),
+  landmarker: path.join(BUNDLE_DIR, 'models', 'face_landmarker.task'),
+  pyannote:   path.join(BUNDLE_DIR, 'models', 'pyannote'),
+}
+const HAS_BUNDLE = fs.existsSync(BUNDLED.python) && fs.existsSync(BUNDLED.ffmpeg)
+
+// Without a bundle (dev): the project venv, else an app-managed venv in userData.
 const PROJECT_VENV = IS_PKG ? null : path.resolve(__dirname, '..', 'venv')
 function findReadyVenv() {
+  if (HAS_BUNDLE) return path.join(BUNDLE_DIR, 'python')
   if (PROJECT_VENV && fs.existsSync(path.join(PROJECT_VENV, 'bin', 'python3'))) {
     return PROJECT_VENV
   }
@@ -108,7 +121,36 @@ ipcMain.handle('dialog:audio', async () => {
 })
 
 // ── First-time setup ──────────────────────────────────────────────────────────
+// Self-check of the bundled runtime: fail at launch with a clear message rather
+// than halfway through a 30-minute job.
+function bundleSelfCheck() {
+  const problems = []
+  const env = { HOME: os.homedir(), PATH: `${BUNDLED.bin}:/usr/bin:/bin`,
+                PYANNOTE_CACHE: BUNDLED.pyannote, HF_HUB_OFFLINE: '1', PYTHONWARNINGS: 'ignore',
+                PYTHONDONTWRITEBYTECODE: '1' }
+  try {
+    execSync(`"${BUNDLED.python}" -c "import torch, pyannote.audio, mediapipe, cv2, scipy, numpy"`,
+      { timeout: 60000, env, stdio: 'pipe' })
+  } catch (e) { problems.push('bundled Python packages failed to load') }
+  try {
+    const enc = execSync(`"${BUNDLED.ffmpeg}" -hide_banner -encoders`, { timeout: 20000, stdio: 'pipe' }).toString()
+    if (!enc.includes('hevc_videotoolbox')) problems.push('bundled ffmpeg lacks VideoToolbox HEVC')
+  } catch (e) { problems.push('bundled ffmpeg does not run') }
+  if (!fs.existsSync(BUNDLED.landmarker)) problems.push('face model missing')
+  for (const m of ['speaker-diarization-3.1', 'segmentation-3.0', 'wespeaker-voxceleb-resnet34-LM']) {
+    if (!fs.existsSync(path.join(BUNDLED.pyannote, `models--pyannote--${m}`))) problems.push(`model ${m} missing`)
+  }
+  if (process.arch !== 'arm64') problems.push('this build needs an Apple Silicon Mac (M1 or newer)')
+  return problems
+}
+
 ipcMain.handle('setup:check', () => {
+  if (HAS_BUNDLE) {
+    const problems = bundleSelfCheck()
+    return problems.length
+      ? { ready: false, bundled: true, reason: problems.join('; ') }
+      : { ready: true, bundled: true }
+  }
   // Re-evaluate in case the project venv appeared since app start
   const bestVenv = findReadyVenv()
   if (bestVenv !== VENV_DIR) refreshVenvPaths(bestVenv)
@@ -216,11 +258,12 @@ function completedSteps(jobDir) {
   return {
     audio:    d('data/audio.wav'),
     sync:     d('data/external_audio_aligned.wav'),
-    extract:  hasFrames(jobDir),
-    detect:   d('data/speaker_positions.json'),
+    extract:  hasFrames(jobDir) && d('frames/meta.json'),
+    // geometry-v2 outputs: older job dirs lack these, so those steps re-run
+    detect:   d('data/speaker_positions.json') && d('data/face_tracks.json'),
     presence: d('data/presence.json'),
     diarize:  d('data/diarization.json'),
-    automap:  d('data/speaker_map.json'),
+    automap:  d('data/speaker_map.json') && d('data/speaker_probs.json'),
     render:   d('output/final.mp4'),
   }
 }
@@ -280,8 +323,9 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
   }
 
   const venvBin = path.join(VENV_DIR, 'bin')
-  // Resolve face_landmarker model: userData/models, then project data/, then SCRIPTS_DIR/data/
+  // Resolve face_landmarker model: bundle, userData/models, then project data/
   const modelCandidates = [
+    BUNDLED.landmarker,
     path.join(MODELS_DIR, 'face_landmarker.task'),
     path.join(SCRIPTS_DIR, 'data', 'face_landmarker.task'),
   ]
@@ -295,8 +339,14 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
     FACE_LANDMARKER_MODEL: modelPath,
     PYTHONWARNINGS:        'ignore',
     PYTHONUNBUFFERED:      '1',        // force immediate stdout/stderr flush (required for progress bars)
+    PYTHONDONTWRITEBYTECODE: '1',      // never write __pycache__ into the (signed) app bundle
     GLOG_minloglevel:      '2',        // suppress MediaPipe C++ INFO/WARNING noise
-    PATH: `${venvBin}:/opt/homebrew/bin:/usr/local/bin:${process.env.PATH}`,
+    // bundled: only the app's own python/ffmpeg + system dirs — never Homebrew
+    PATH: HAS_BUNDLE
+      ? `${BUNDLED.bin}:${venvBin}:/usr/bin:/bin:/usr/sbin:/sbin`
+      : `${venvBin}:/opt/homebrew/bin:/usr/local/bin:${process.env.PATH}`,
+    // bundled pyannote weights → no Hugging Face token or network needed
+    ...(HAS_BUNDLE ? { PYANNOTE_CACHE: BUNDLED.pyannote, HF_HUB_OFFLINE: '1' } : {}),
   }
   const opts = { cwd: jobDir, env }
 
@@ -310,7 +360,7 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
     hasAudio ? { id: 'sync', label: 'Sync Audio', script: '5_sync_audio.py',
       args: [videoPath, audioPath] } : null,
     { id: 'extract',   label: 'Extract Frames',   script: '1_extract_frames.py',
-      args: [videoPath, '10'] },
+      args: [videoPath, '2'] },
     { id: 'detect',    label: 'Detect Speakers',  script: '2_detect_speakers.py',
       args: [] },
     { id: 'presence',  label: 'Detect Presence',  script: '2b_detect_presence.py',
@@ -342,9 +392,11 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
   // render's final audio overlay.
   if (!done.audio)    done.sync    = false   // sync needs the camera audio reference
   if (!done.audio)    done.diarize = false   // diarize uses the camera audio
+  if (!done.extract)  done.detect  = false   // seats + face tracks come from the frames
   if (!done.diarize)  done.automap = false
   if (!done.detect)   done.automap = false
-  if (!done.detect)   done.presence = false   // presence is built from detected positions
+  if (!done.detect)   done.presence = false   // presence is built from the face tracks
+  if (!done.presence) done.automap = false    // mapping gates speakers on presence
   if (!done.automap)  done.render  = false
   if (hasAudio && !done.sync) done.render = false  // render overlays the synced mic
   if (!done.presence) done.render  = false    // render consumes presence to gate empty chairs
@@ -394,12 +446,18 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
   const stepMap = Object.fromEntries(steps.map(s => [s.id, s]))
 
   try {
-    // Phase 1 — extract frames (serial prerequisite for everything)
+    // Phase 0 — camera audio first: an audio problem fails in seconds
+    await runStep(stepMap['audio'])
+
+    // Phase 1 — extract frames (serial prerequisite for everything visual)
     await runStep(stepMap['extract'])
 
-    // Phase 2 — detect + (optional sync then) diarize in parallel
+    // Phase 2 — detect → presence, in parallel with (optional sync then) diarize
     if (!pipelineAborted) {
-      const detectChain  = () => runStep(stepMap['detect'])
+      const detectChain  = async () => {
+        await runStep(stepMap['detect'])
+        await runStep(stepMap['presence'])
+      }
       const diarizeChain = async () => {
         if (stepMap['sync']) await runStep(stepMap['sync'])
         await runStep(stepMap['diarize'])

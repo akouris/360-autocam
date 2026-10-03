@@ -61,7 +61,7 @@ else
 fi
 
 echo "=== Step 1: Extract frames ==="
-python3 1_extract_frames.py "$VIDEO" 10
+python3 1_extract_frames.py "$VIDEO" 2
 
 echo "=== Step 2: Detect speaker positions ==="
 python3 2_detect_speakers.py
@@ -73,7 +73,7 @@ python3 2b_detect_presence.py
 echo "=== Step 3: Speaker diarization (camera audio) ==="
 python3 3_diarize.py "$VIDEO"
 
-echo "=== Step 3b: Auto-map speakers to positions ==="
+echo "=== Step 3b: Track mouths + map speakers (who speaks when) ==="
 python3 3_automap.py "$VIDEO"
 
 echo "=== Step 4: Render ==="

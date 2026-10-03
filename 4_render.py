@@ -2,530 +2,576 @@
 """
 Step 4: Render the final 9:16 vertical video.
 
-Single speaker  → full 1080x1920 crop
-Two speakers    → split-screen: top 1080x960 + bottom 1080x960 (vstack)
-Cuts            → hard cuts via concat demuxer (no re-encoding overhead)
-Encoding        → VideoToolbox hardware H.264
+Shot types (all 1080×1920, stacked panes):
+  single → one 1080×1920 pane
+  split  → two 1080×960 panes   (speaker + listener, or two candidates)
+  triple → speaker 1080×960 on top + two 540×960 boxes side by side below
+A confident speaker's turn cycles: solo intro → split → triple → split → single …
 
-Reads:
-  data/speaker_positions.json  — per-speaker yaw/pitch/fov/stream
-  data/diarization.json        — who speaks when (including overlaps)
-  data/speaker_map.json        — maps diarization IDs to position keys (auto or manual)
+Who is on screen comes from data/speaker_probs.json (step 3b): a probability
+distribution over seats every 0.5s.
+  • Turns are found by Viterbi smoothing with a switch penalty, so a 1-second
+    "yeah" or a diarization blip doesn't yank the camera.
+  • A CONFIDENT turn → brief solo intro on the speaker, then splits whose second
+    pane cycles through the other present people (listener reactions).
+  • An UNCERTAIN turn → the 2 or 3 likely speakers are shown together (double
+    or triple shot), so whoever is actually talking is always on screen.
+  • Overlapping speech → the overlapping people together.
+  • No speech → carousel through whoever is physically present.
+INVARIANT: the output always carousels among PRESENT people and never holds a
+static single shot — even if mapping is wrong (see emit_gap_carousel).
 
-Output: output/final.mp4
+Framing: every pane is aimed at the face's actual position during that shot
+(data/framing_tracks.json, 1 Hz from the mouth-tracking pass; falls back to
+data/face_tracks.json), zoomed by face size, with the face in the upper part
+of the frame (geometry.frame_view). Panes are cut from the stitched 360° view,
+so people sitting on the lens seam frame correctly.
+
+Encoding: VideoToolbox HEVC; video-only segments concatenated, then ONE
+continuous audio track laid over the whole video (no per-cut audio glitches);
+cut points are frame-aligned so A/V never drifts.
 """
 
 import json, math, os, sys, subprocess, tempfile, shutil
+import numpy as np
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-V360_INPUT = "equirect" if os.environ.get("VIDEO_MODE") == "equirect" else "fisheye"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import geometry
 
-N_RENDER_WORKERS  = min(6, max(2, (os.cpu_count() or 4) - 2))  # scales with core count
+N_RENDER_WORKERS = min(6, max(2, (os.cpu_count() or 4) - 2))
 
 OUTPUT_WIDTH  = 1080
 OUTPUT_HEIGHT = 1920
-HALF_HEIGHT   = OUTPUT_HEIGHT // 2   # 960px per half in split-screen
-MIN_SEGMENT      = 0.8   # skip segments shorter than this (seconds)
+# pane sizes per shot: single = full frame; split = two stacked halves;
+# triple = speaker on top half, two people side by side in the bottom half
+PANES = {
+    1: [(OUTPUT_WIDTH, OUTPUT_HEIGHT)],
+    2: [(OUTPUT_WIDTH, OUTPUT_HEIGHT // 2)] * 2,
+    3: [(OUTPUT_WIDTH, OUTPUT_HEIGHT // 2), (OUTPUT_WIDTH // 2, OUTPUT_HEIGHT // 2),
+        (OUTPUT_WIDTH // 2, OUTPUT_HEIGHT // 2)],
+}
+LAYOUT = {1: "vstack", 2: "vstack", 3: "top_pair"}
+# within a long confident turn the shot cycles through these (after the solo intro)
+CYCLE = ["split", "triple", "split", "single"]
+
+MIN_SEGMENT      = 0.8   # shortest shot (seconds)
 SOLO_INTRO_DUR   = 2.0   # full-screen solo when the primary speaker changes
 SOLO_REINTRO_GAP = 10.0  # seconds since last being primary before solo intro fires again
 CAROUSEL_DUR     = 4.0   # how long each secondary slot shows before rotating
-ACTIVITY_WINDOW  = 60    # seconds without real speech → exclude from carousel
-MIN_ACTIVITY_DUR = 2.0   # minimum segment length to count as "real" speech (filters pyannote blips)
+SWITCH_PENALTY   = 3.0   # Viterbi cost (nats) of changing speaker → min turn ≈ 1.5s
+GAP_BRIDGE       = 1.5   # silences shorter than this stay inside the current turn
+CONF_HI          = 0.60  # mean p(primary) at/above this → confident single-speaker turn
+CAND_MIN_P       = 0.15  # a seat needs this mean p to be a candidate in an uncertain turn
+SECONDARY_P      = 0.20  # a listener this likely to be talking takes the second pane
+MIN_REGIME       = 3.0   # confident/uncertain stretches shorter than this are merged
+
 
 def load_json(p):
-    with open(p) as f: return json.load(f)
+    with open(p) as f:
+        return json.load(f)
 
-def calc_v_fov(h_fov, height):
-    return round(2 * math.degrees(math.atan(math.tan(math.radians(h_fov / 2)) * (height / OUTPUT_WIDTH))), 1)
-
-def norm_yaw(y):
-    """Normalize yaw to [-180, 180] as required by ffmpeg v360."""
-    return ((y + 180) % 360) - 180
-
-def filter_yaw(pos):
-    """
-    Convert stored global yaw to lens-local yaw for the v360 filter.
-    Detection stores global yaw with a +180° offset for the back lens;
-    v360 needs yaw relative to the lens center (offset removed).
-    """
-    offset = 180.0 if pos.get("lens") == "back" else 0.0
-    return norm_yaw(pos["yaw_degrees"] - offset)
-
-def _safe_hfov(pos):
-    """
-    Clamp h_fov so the far horizontal edge of the crop stays within the
-    equidistant fisheye circle (usable up to ~90° from the optical axis).
-    Speakers near the lens edge need a tighter FOV to avoid black borders.
-    Constraint: abs(filter_yaw) + h_fov/2 <= 88° (2° safety margin).
-    """
-    local_yaw_abs = abs(filter_yaw(pos))
-    h_fov_max = max(20.0, 2.0 * (88.0 - local_yaw_abs))
-    return min(float(pos.get("h_fov", 75)), h_fov_max)
-
-def _audio_inputs(video_path, start, external_audio):
-    """Return (ffmpeg input args, audio map flag) for camera or external audio."""
-    if external_audio:
-        # second input is the pre-aligned external WAV; seek it to match the segment
-        return (["-ss", str(start), "-i", video_path,
-                 "-ss", str(start), "-i", external_audio],
-                "-map", "1:a:0")
-    return (["-ss", str(start), "-i", video_path],
-            "-map", "0:a:0")
 
 def _run_ffmpeg(cmd):
     """Run an ffmpeg command; on failure re-raise with stderr included."""
     r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
         err = r.stderr.decode(errors='replace').strip()
-        # surface the last few lines of ffmpeg output so the error is visible
         tail = '\n'.join(err.splitlines()[-12:])
         raise subprocess.CalledProcessError(r.returncode, cmd, output=r.stdout, stderr=tail.encode())
 
-def extract_segment(video_path, pos, start, end, out_path, height=OUTPUT_HEIGHT,
-                    external_audio=None):
-    # VIDEO ONLY. Audio is laid on as one continuous track after concat (see
-    # _render_inner) — per-segment audio re-encoding would add AAC priming/padding
-    # at every one of the ~hundreds of joins and make the audio audibly jump.
-    stream = pos.get("stream", 0)
-    yaw    = filter_yaw(pos)
-    pitch  = pos.get("pitch_degrees", 0)
-    h_fov  = _safe_hfov(pos)
-    v_fov  = calc_v_fov(h_fov, height)
+
+# ── Seats & framing ───────────────────────────────────────────────────────────
+
+def load_positions(path="data/speaker_positions.json"):
+    """Seats in the geometry-v2 global frame. Older job dirs stored back-lens yaw
+    mirrored (180 − local); convert so they render at the right spot."""
+    pos = load_json(path)
+    scale = geometry.lens_fov() / 180.0 if geometry.video_mode() == "fisheye" else 1.0
+    for k, p in pos.items():
+        if p.get("geom") != 2:
+            # old angles were measured assuming a 180° lens; rescale to the real FOV
+            if p.get("lens") == "back":
+                local = geometry.norm_yaw(180.0 - p["yaw_degrees"])
+                p["yaw_degrees"] = geometry.norm_yaw(180.0 + local * scale)
+            else:
+                p["yaw_degrees"] = geometry.norm_yaw(geometry.norm_yaw(p["yaw_degrees"]) * scale)
+            p["pitch_degrees"] = p.get("pitch_degrees", 0.0) * scale
+            p["geom"] = 2
+        p.setdefault("face_deg", geometry.DEFAULT_FACE_DEG)
+    return pos
+
+
+class Framer:
+    """Where each seat's face is at any time → v360 view for a pane."""
+
+    def __init__(self, positions):
+        self.pos = positions
+        # fine: 1 Hz from the 12.5fps mouth pass; coarse: every frame of step 2
+        self.fine, self.coarse = defaultdict(list), defaultdict(list)
+        if os.path.exists("data/framing_tracks.json"):
+            for k, rows in load_json("data/framing_tracks.json").items():
+                self.fine[k] = [tuple(r) for r in rows]
+        if os.path.exists("data/face_tracks.json"):
+            ft = load_json("data/face_tracks.json")
+            iv = float(ft["interval"])
+            for k, tr in ft["seats"].items():
+                self.coarse[k] = [(i * iv, x[0], x[1], x[2]) for i, x in enumerate(tr) if x]
+
+    @staticmethod
+    def _window(rows, t0, t1, pad):
+        return [r for r in rows if t0 - pad <= r[0] <= t1 + pad]
+
+    def face_at(self, seat, t0, t1):
+        """(yaw, pitch, size, yaw_spread) of the seat's face over [t0, t1]."""
+        p = self.pos[seat]
+        base = (p["yaw_degrees"], p["pitch_degrees"], p.get("face_deg", 10.0), 0.0)
+        rows = []
+        # nearest-in-time evidence first; only widen when there's nothing closer
+        for src, pad in (("fine", 0.5), ("coarse", 1.5), ("fine", 3.0),
+                         ("coarse", 4.0), ("fine", 8.0), ("coarse", 10.0)):
+            rows = self._window((self.fine if src == "fine" else self.coarse).get(seat, []), t0, t1, pad)
+            if rows:
+                break
+        if not rows:
+            return base
+        ref = base[0]
+        rel = np.array([geometry.norm_yaw(r[1] - ref) for r in rows])
+        med = float(np.median(rel))
+        rel_in = rel[np.abs(rel - med) < 12]      # drop tracker glitches
+        if not len(rel_in):
+            rel_in = rel
+        yaw = geometry.norm_yaw(ref + float(np.median(rel_in)))
+        pitch = float(np.median([r[2] for r in rows]))
+        size = float(np.median([r[3] for r in rows]))
+        spread = float(rel_in.max() - rel_in.min()) if len(rel_in) > 1 else 0.0
+        return yaw, pitch, size, spread
+
+    def dedupe(self, seats, t0, t1):
+        """Drop a pane whose face is where an earlier pane already points (a
+        tracker that drifted onto a neighbour would show one person twice)."""
+        kept, aims = [], []
+        for s in seats:
+            y, p, size, _ = self.face_at(s, t0, t1)
+            if all(abs(geometry.norm_yaw(y - ay)) > max(6.0, 0.8 * size) or abs(p - ap) > size
+                   for ay, ap in aims):
+                kept.append(s); aims.append((y, p))
+        return kept
+
+    def views(self, seats, t0, t1):
+        out = []
+        for s, (w, h) in zip(seats, PANES[len(seats)]):
+            yaw, pitch, size, spread = self.face_at(s, t0, t1)
+            cy, cp, hf, vf = geometry.frame_view(yaw, pitch, size, w, h, spread)
+            out.append((cy, cp, hf, vf, w, h))
+        return out
+
+
+def same_framing(a, b):
+    """Is view b close enough to view a that re-aiming would only add a twitch?
+    Dead-zone: the face may drift ~15% of the frame / the zoom ~15% before we
+    re-frame."""
+    ya, pa, ha, va = a[:4]
+    yb, pb, hb, vb = b[:4]
+    return (abs(geometry.norm_yaw(yb - ya)) <= 0.15 * ha
+            and abs(pb - pa) <= 0.12 * va
+            and abs(hb - ha) <= 0.15 * ha)
+
+
+def encode_shot(video_path, views, start, end, out_path):
+    """VIDEO ONLY. Audio is laid on as one continuous track after concat."""
     _run_ffmpeg([
-        "ffmpeg", "-ss", str(start), "-i", video_path,
-        "-t", str(end - start),
-        "-map", f"0:v:{stream}", "-an",
-        "-vf", f"v360={V360_INPUT}:flat:yaw={yaw}:pitch={pitch}:h_fov={h_fov}:v_fov={v_fov}:w={OUTPUT_WIDTH}:h={height}",
-        "-c:v", "hevc_videotoolbox", "-b:v", "8M",
-        out_path, "-y"
-    ])
-
-def extract_split_segment(video_path, pos_top, pos_bot, start, end, out_path,
-                          external_audio=None):
-    s_top = pos_top.get("stream", 0)
-    s_bot = pos_bot.get("stream", 0)
-
-    def vf(pos, label):
-        y, p = filter_yaw(pos), pos.get("pitch_degrees", 0)
-        hf   = _safe_hfov(pos)
-        vf_  = calc_v_fov(hf, HALF_HEIGHT)
-        return f"v360={V360_INPUT}:flat:yaw={y}:pitch={p}:h_fov={hf}:v_fov={vf_}:w={OUTPUT_WIDTH}:h={HALF_HEIGHT}[{label}]"
-
-    if s_top == s_bot:
-        # Same stream — must split first; referencing [0:v:N] twice in filter_complex fails in FFmpeg 6+
-        fc = f"[0:v:{s_top}]split=2[_a][_b];[_a]{vf(pos_top,'t')};[_b]{vf(pos_bot,'b')};[t][b]vstack=inputs=2[out]"
-    else:
-        fc = f"[0:v:{s_top}]{vf(pos_top,'t')};[0:v:{s_bot}]{vf(pos_bot,'b')};[t][b]vstack=inputs=2[out]"
-
-    # VIDEO ONLY — see extract_segment; audio is muxed once, after concat.
-    _run_ffmpeg([
-        "ffmpeg", "-ss", str(start), "-i", video_path,
-        "-t", str(end - start),
-        "-filter_complex", fc,
+        "ffmpeg", "-hwaccel", "videotoolbox", "-ss", f"{start:.6f}", "-i", video_path,
+        "-t", f"{end - start:.6f}",
+        "-filter_complex", geometry.views_graph(views, layout=LAYOUT[len(views)]),
         "-map", "[out]", "-an",
         "-c:v", "hevc_videotoolbox", "-b:v", "8M",
         out_path, "-y"
     ])
 
 
-def resolve_timeline(diarization, speaker_to_pos, video_duration=None, overlaps=None,
-                     presence=None):
+# ── Speaker probabilities ─────────────────────────────────────────────────────
+
+def load_speaker_steps(positions, diarization, speaker_map, overlaps):
+    """data/speaker_probs.json if present; otherwise derive the same structure
+    from diarization + speaker_map (older job dirs): mapped seat gets p=1."""
+    if os.path.exists("data/speaker_probs.json"):
+        sp = load_json("data/speaker_probs.json")
+        return float(sp["step"]), sp["steps"]
+    step = 0.5
+    end = max([s["end"] for s in diarization] or [0])
+    n = int(math.ceil(end / step))
+    active = [set() for _ in range(n)]
+    for s in diarization:
+        seat = speaker_map.get(s["speaker"])
+        if seat in positions:
+            for i in range(int(s["start"] / step), min(n, int(math.ceil(s["end"] / step)))):
+                active[i].add(seat)
+    osd = set()
+    for o in overlaps or []:
+        osd.update(range(int(o["start"] / step), int(math.ceil(o["end"] / step))))
+    steps = []
+    for i, a in enumerate(active):
+        if not a:
+            steps.append(None)
+        else:
+            steps.append({"p": {k: 1.0 / len(a) for k in a}, "overlap": len(a) > 1 or i in osd})
+    return step, steps
+
+
+def viterbi(emis, penalty):
+    """emis: (T, S) log-likelihoods → best state path with a switch penalty."""
+    T, S = emis.shape
+    score = emis[0].copy()
+    back = np.zeros((T, S), dtype=np.int32)
+    for t in range(1, T):
+        best_prev = int(np.argmax(score))
+        stay = score
+        switch = score[best_prev] - penalty
+        back[t] = np.where(stay >= switch, np.arange(S), best_prev)
+        score = np.maximum(stay, switch) + emis[t]
+    path = np.zeros(T, dtype=np.int32)
+    path[-1] = int(np.argmax(score))
+    for t in range(T - 1, 0, -1):
+        path[t - 1] = back[t, path[t]]
+    return path
+
+
+# ── Timeline ──────────────────────────────────────────────────────────────────
+
+def resolve_timeline(steps, step, seats, video_end, presence=None):
     """
-    Split-screen first: the default shot is ALWAYS a split.
-
-    For every moment in the video we pick a primary speaker (whoever diarization
-    says is speaking; last known speaker during gaps).  The timeline is:
-
-      • Speaker changes → SOLO_INTRO_DUR seconds of full-screen solo ("intro")
-      • Everything else  → split(primary, secondary) where secondary rotates
-                           through all other speakers every CAROUSEL_DUR seconds
-
-    This means the viewer always sees the speaking person AND at least one
-    listener / co-host, with the listener slot cycling continuously.
+    Returns [{type: single|split|triple, speakers: [...], start, end, gap_fill}]
+    tiling [0, video_end] with no gaps.
     """
-    # Sort speakers most-active first so the carousel opens with the next busiest talker
-    spk_speech = defaultdict(float)
-    for seg in diarization:
-        if seg["speaker"] in speaker_to_pos:
-            spk_speech[seg["speaker"]] += seg["end"] - seg["start"]
-    pos_keys = sorted(speaker_to_pos.keys(), key=lambda k: spk_speech[k], reverse=True)
+    seats = list(seats)
+    S = len(seats)
+    idx = {k: i for i, k in enumerate(seats)}
 
-    # Distinct CAMERA SEATS, one representative speaker-label each. Several
-    # diarization labels can map to the same seat (pyannote over-segments one
-    # person into many IDs); the carousel must treat them as a single face, so
-    # we dedupe by position-object identity and keep the busiest label per seat.
-    _seat_repr = {}
-    for k in pos_keys:
-        pid = id(speaker_to_pos[k])
-        if pid not in _seat_repr or spk_speech[k] > spk_speech[_seat_repr[pid]]:
-            _seat_repr[pid] = k
-    distinct_positions = sorted(_seat_repr.values(), key=lambda k: spk_speech[k], reverse=True)
-
-    # Build per-speaker sorted end-time list for fast recency lookups (binary search)
-    spk_ends = defaultdict(list)
-    for seg in diarization:
-        if seg["speaker"] in speaker_to_pos:
-            spk_ends[seg["speaker"]].append(seg["end"])
-    for spk in spk_ends:
-        spk_ends[spk].sort()
-
-    def last_spoke_before(spk, t):
-        """Latest segment-end time for spk strictly before t; -inf if never spoke."""
-        ends = spk_ends.get(spk, [])
-        lo, hi = 0, len(ends)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if ends[mid] < t:
-                lo = mid + 1
-            else:
-                hi = mid
-        return ends[lo - 1] if lo > 0 else float('-inf')
-
-    # Substantial-speech lookup: only count segments >= MIN_ACTIVITY_DUR (ignores blips)
-    spk_real_ends = defaultdict(list)
-    for _seg in diarization:
-        if (_seg["speaker"] in speaker_to_pos
-                and _seg["end"] - _seg["start"] >= MIN_ACTIVITY_DUR):
-            spk_real_ends[_seg["speaker"]].append(_seg["end"])
-    for _spk in spk_real_ends:
-        spk_real_ends[_spk].sort()
-
-    def last_real_spoke_before(spk, t):
-        """Latest end of a real (>= MIN_ACTIVITY_DUR) segment before t; -inf if none."""
-        ends = spk_real_ends.get(spk, [])
-        lo, hi = 0, len(ends)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if ends[mid] < t:
-                lo = mid + 1
-            else:
-                hi = mid
-        return ends[lo - 1] if lo > 0 else float('-inf')
-
-    # ── Physical-presence lookup (from face detection over time) ──────────────
-    # presence = {"interval": s, "num_frames": N, "by_speaker": {spk: set(frame_idx)}}
-    # is_present(spk, t): is this speaker's face visible at time t (smoothed)?
-    # When no presence data is available we treat everyone as always present so
-    # the carousel falls back to pure speech-recency behaviour.
+    # ── presence ──
     if presence:
-        _pres_int   = presence.get("interval", 10) or 10
-        _pres_N     = presence.get("num_frames", 0)
-        _pres_by_sp = presence.get("by_speaker", {})
+        iv = float(presence.get("interval", 10) or 10)
+        N = int(presence.get("num_frames", 0))
+        pres = {k: {int(round(t / iv)) for t in v} for k, v in presence.get("positions", {}).items()}
 
-        def is_present(spk, t):
-            frames = _pres_by_sp.get(spk)
-            if frames is None:
-                return True            # unknown speaker → don't suppress
-            idx = int(round(t / _pres_int))
-            if _pres_N:
-                idx = max(0, min(_pres_N - 1, idx))
-            return idx in frames
+        def is_present(k, t):
+            if k not in pres:
+                return True
+            i = int(round(t / iv))
+            if N:
+                i = max(0, min(N - 1, i))
+            return i in pres[k]
     else:
-        def is_present(spk, t):
+        def is_present(k, t):
             return True
 
-    # Fall back to last real-speaker end time; don't let broadcast-audio artifacts extend the video
-    real_ends = [s["end"] for s in diarization if s["speaker"] in speaker_to_pos and s["end"]]
-    video_end = video_duration or (max(real_ends) if real_ends else 0.0)
+    def present_at(t):
+        return [k for k in seats if is_present(k, t)]
 
-    # Build a lookup: at any time t, which real speaker is "primary"?
-    # Merge consecutive same-speaker real segments for efficiency.
-    real_segs = sorted(
-        [s for s in diarization if s["speaker"] in speaker_to_pos],
-        key=lambda s: s["start"]
-    )
-    merged = []
-    for seg in real_segs:
-        if (merged and merged[-1]["speaker"] == seg["speaker"]
-                and seg["start"] <= merged[-1]["end"] + 0.15):
-            merged[-1] = dict(merged[-1], end=max(merged[-1]["end"], seg["end"]))
-        else:
-            merged.append(dict(seg))
+    def present_during(k, t0, t1):
+        """Present at the start, middle and end of [t0, t1] — someone who walks
+        off mid-shot must not leave an empty chair on screen."""
+        return all(is_present(k, x) for x in (t0, (t0 + t1) / 2, max(t0, t1 - 0.25)))
 
-    def primary_at(t):
-        """Nearest real speaker at time t; None if no real segment covers t."""
-        for seg in merged:
-            if seg["start"] <= t < seg["end"]:
-                return seg["speaker"]
-        return None
+    n = int(math.ceil(video_end / step))
+    steps = (list(steps) + [None] * n)[:n]
 
-    timeline          = []
-    sec_idx           = defaultdict(int)   # per-primary: which secondary is next
-    last_primary      = merged[0]["speaker"] if merged else pos_keys[0]
-    last_primary_end  = {}                 # spk → timestamp when they last stopped being primary
-    gap_ptr           = 0                  # rotates the gap-carousel through present seats
-
-    def emit_window(t_start, t_end, primary, is_new_primary):
-        """Fill [t_start, t_end] with intro solo + carousel splits."""
-        nonlocal last_primary
-        if t_end - t_start < MIN_SEGMENT:
-            return
-        primary_pos = speaker_to_pos[primary]
-        # Candidate secondaries = OTHER distinct seats, busiest-talker first.
-        others = sorted(
-            [s for s in distinct_positions if speaker_to_pos[s] is not primary_pos],
-            key=lambda s: last_real_spoke_before(s, t_start),
-            reverse=True,
-        )
-
-        def eligible_secs(t):
-            """Secondaries we may show in a split at time t.
-
-            Primary gate is PHYSICAL PRESENCE: never show a split with someone
-            whose chair is empty. When presence data is unavailable, fall back
-            to speech-recency (within ACTIVITY_WINDOW) as a presence proxy.
-            """
-            if presence:
-                return [s for s in others if is_present(s, t)]
-            return [s for s in others
-                    if last_real_spoke_before(s, t) >= t - ACTIVITY_WINDOW]
-
-        t = t_start
-
-        # Brief solo intro when primary speaker changes — only if:
-        #  • window is long enough
-        #  • this speaker hasn't been primary recently (avoids solo↔split chop on rapid exchanges)
-        gap_since_primary = t_start - last_primary_end.get(primary, float('-inf'))
-        if (is_new_primary and others
-                and gap_since_primary >= SOLO_REINTRO_GAP
-                and (t_end - t_start) > SOLO_INTRO_DUR + MIN_SEGMENT):
-            solo_end = min(t + SOLO_INTRO_DUR, t_end)
-            if solo_end - t >= MIN_SEGMENT:
-                timeline.append({"type": "single", "speakers": [primary],
-                                 "start": t, "end": solo_end, "gap_fill": False})
-                t = solo_end
-
-        # Carousel splits for everything else. NEVER emit a single shot longer
-        # than one slot — if no secondary is present this slot, re-check next slot.
-        while t < t_end - MIN_SEGMENT:
-            # Only rotate among seats physically present right now.
-            active = eligible_secs(t)
-            slot_end = min(t + CAROUSEL_DUR, t_end)
-            if active:
-                # Normal rotation among present speakers
-                sec = active[sec_idx[primary] % len(active)]
-                sec_idx[primary] += 1
-                if slot_end - t >= MIN_SEGMENT:
-                    timeline.append({"type": "split", "speakers": [primary, sec],
-                                     "start": t, "end": slot_end, "gap_fill": False})
+    # ── speech blocks (short silences bridged) ──
+    speech = [s is not None and bool(s.get("p")) for s in steps]
+    blocks, i = [], 0
+    bridge = int(round(GAP_BRIDGE / step))
+    while i < n:
+        if not speech[i]:
+            i += 1; continue
+        j = i
+        while j < n:
+            if speech[j]:
+                j += 1; continue
+            k = j
+            while k < n and not speech[k]:
+                k += 1
+            if k < n and k - j <= bridge:
+                j = k
             else:
-                # No active secondary — go solo for this slot, re-check next slot
-                if slot_end - t >= MIN_SEGMENT:
-                    timeline.append({"type": "single", "speakers": [primary],
-                                     "start": t, "end": slot_end, "gap_fill": False})
-            t = slot_end
-
-        # Emit any remaining tail the loop skipped to avoid gaps in audio
-        if t < t_end:
-            remaining = t_end - t
-            if remaining >= MIN_SEGMENT:
-                if others:
-                    active = eligible_secs(t)
-                    if active:
-                        sec = active[sec_idx[primary] % len(active)]
-                        timeline.append({"type": "split", "speakers": [primary, sec],
-                                         "start": t, "end": t_end, "gap_fill": False})
-                    else:
-                        timeline.append({"type": "single", "speakers": [primary],
-                                         "start": t, "end": t_end, "gap_fill": False})
-                else:
-                    timeline.append({"type": "single", "speakers": [primary],
-                                     "start": t, "end": t_end, "gap_fill": False})
-            elif timeline:
-                # Stretch the last segment to absorb a near-zero tail
-                timeline[-1] = dict(timeline[-1], end=t_end)
-
-        if is_new_primary and last_primary != primary:
-            last_primary_end[last_primary] = t_start
-        last_primary = primary
-
-    def emit_gap_carousel(t_start, t_end):
-        """No mapped speaker is talking across [t_start, t_end] (silence, broadcast
-        audio, or speech we failed to map). The INVARIANT: never hold a static
-        single shot. Rotate the primary through the PRESENT seats and alternate a
-        brief single with a split, so the output always carousels among whoever is
-        physically in frame — regardless of diarization/mapping quality.
-
-        Falls back gracefully: if presence data is missing, is_present() is always
-        True, so this still rotates through every seat instead of freezing."""
-        nonlocal gap_ptr, last_primary
-        if t_end - t_start < MIN_SEGMENT:
-            return
-        t = t_start
-        while t < t_end - MIN_SEGMENT:
-            present = [p for p in distinct_positions if is_present(p, t)]
-            if not present:
-                present = [last_primary if last_primary in distinct_positions
-                           else distinct_positions[0]]
-            primary = present[gap_ptr % len(present)]
-            mates   = [p for p in present if speaker_to_pos[p] is not speaker_to_pos[primary]]
-
-            # Brief single of the current seat …
-            solo_end = min(t + SOLO_INTRO_DUR, t_end)
-            if solo_end - t >= MIN_SEGMENT:
-                timeline.append({"type": "single", "speakers": [primary],
-                                 "start": t, "end": solo_end, "gap_fill": True})
-                t = solo_end
-            if t >= t_end - MIN_SEGMENT:
                 break
-            # … then a split pairing it with another present seat.
-            slot_end = min(t + CAROUSEL_DUR, t_end)
-            if mates:
-                sec = mates[gap_ptr % len(mates)]
-                timeline.append({"type": "split", "speakers": [primary, sec],
-                                 "start": t, "end": slot_end, "gap_fill": True})
+        blocks.append((i, j)); i = j
+
+    min_regime = int(round(MIN_REGIME / step))
+
+    def certainty_runs(a, b, primary):
+        """Split one speaker's turn into confident / uncertain stretches (each at
+        least MIN_REGIME long) so a sure stretch isn't diluted by an unsure one."""
+        flags, last = [], True
+        for x in range(a, b):
+            st = steps[x]
+            if st and st.get("p"):
+                last = st["p"].get(primary, 0.0) >= CONF_HI and not st.get("overlap")
+            flags.append(last)
+        runs = []
+        for i, f in enumerate(flags):
+            if runs and runs[-1][2] == f:
+                runs[-1][1] = a + i + 1
             else:
-                timeline.append({"type": "single", "speakers": [primary],
-                                 "start": t, "end": slot_end, "gap_fill": True})
+                runs.append([a + i, a + i + 1, f])
+        merged = []
+        for r in runs:                       # absorb short flickers into the previous run
+            if merged and (r[1] - r[0] < min_regime or merged[-1][1] - merged[-1][0] < min_regime):
+                prev_len, cur_len = merged[-1][1] - merged[-1][0], r[1] - r[0]
+                merged[-1][1] = r[1]
+                if cur_len > prev_len:       # the longer stretch decides the flag
+                    merged[-1][2] = r[2]
+            else:
+                merged.append(list(r))
+        return [tuple(r) for r in merged]
+
+    # ── turns inside each block via Viterbi ──
+    turns = []        # (a, b, primary, mean_p dict, overlap_frac, sure)
+    for a, b in blocks:
+        T = b - a
+        emis = np.zeros((T, S))
+        for t in range(T):
+            st = steps[a + t]
+            if st and st.get("p"):
+                for k in seats:
+                    emis[t, idx[k]] = math.log(st["p"].get(k, 0.0) + 1e-3)
+            tm = (a + t) * step
+            for k in seats:
+                if not is_present(k, tm) and present_at(tm):
+                    emis[t, idx[k]] -= 6.0
+        path = viterbi(emis, SWITCH_PENALTY)
+        t = 0
+        while t < T:
+            u = t
+            while u < T and path[u] == path[t]:
+                u += 1
+            for ra, rb, sure in certainty_runs(a + t, a + u, seats[path[t]]):
+                ps = [steps[x] for x in range(ra, rb) if steps[x] and steps[x].get("p")]
+                mean = defaultdict(float)
+                for st in ps:
+                    for k, v in st["p"].items():
+                        mean[k] += v / max(1, len(ps))
+                ovl = (sum(1 for st in ps if st.get("overlap")) / len(ps)) if ps else 0.0
+                turns.append((ra, rb, seats[path[t]], dict(mean), ovl, sure))
+            t = u
+
+    timeline = []
+    sec_idx = defaultdict(int)
+    last_primary_end = {}
+    last_primary = [turns[0][2] if turns else (seats[0] if seats else None)]
+    gap_ptr = [0]
+    cycle_pos = {}    # primary → position in CYCLE, carried across that speaker's segments
+
+    def add(kind, spk, t0, t1, gap=False):
+        if t1 - t0 > 1e-3:
+            timeline.append({"type": kind, "speakers": list(spk), "start": t0, "end": t1,
+                             "gap_fill": gap})
+
+    def kind_for(n):
+        return {1: "single", 2: "split", 3: "triple"}[n]
+
+    def slot_p(t0, t1):
+        """Mean speaking probability per seat over [t0, t1]."""
+        a, b = int(t0 / step), max(int(t0 / step) + 1, int(math.ceil(t1 / step)))
+        m = defaultdict(float); c = 0
+        for x in range(a, min(b, n)):
+            st = steps[x]
+            if st and st.get("p"):
+                c += 1
+                for k, v in st["p"].items():
+                    m[k] += v
+        return {k: v / c for k, v in m.items()} if c else {}
+
+    def emit_confident(t0, t1, primary, is_new):
+        t = t0
+        others_any = [k for k in seats if k != primary]
+        since = t0 - last_primary_end.get(primary, float("-inf"))
+        if (is_new and others_any and since >= SOLO_REINTRO_GAP
+                and t1 - t0 > SOLO_INTRO_DUR + MIN_SEGMENT):
+            add("single", [primary], t, t + SOLO_INTRO_DUR); t += SOLO_INTRO_DUR
+        step_i = 0 if is_new else cycle_pos.get(primary, 0)
+        while t < t1 - 1e-6:
+            want = CYCLE[step_i % len(CYCLE)]
+            step_i += 1
+            dur = SOLO_INTRO_DUR if want == "single" else CAROUSEL_DUR
+            slot_end = min(t + dur, t1)
+            if t1 - slot_end < MIN_SEGMENT:
+                slot_end = t1
+            mates = [k for k in others_any if present_during(k, t, slot_end)]
+            sp = slot_p(t, slot_end)
+            if want == "single" and any(sp.get(k, 0) >= SECONDARY_P for k in mates):
+                want = "split"        # someone is chiming in — don't cut them out for a solo
+            if want == "single" or not mates:
+                add("single", [primary], t, slot_end)
+                t = slot_end
+                cycle_pos[primary] = step_i
+                continue
+            # anyone chiming in goes first; then rotate through the listeners
+            talkers = sorted([k for k in mates if sp.get(k, 0) >= SECONDARY_P], key=lambda k: -sp[k])
+            order = talkers + [mates[(sec_idx[primary] + i) % len(mates)] for i in range(len(mates))]
+            picks = list(dict.fromkeys(order))
+            sec_idx[primary] += 1
+            if want == "triple" and len(picks) >= 2:
+                add("triple", [primary] + picks[:2], t, slot_end)
+            else:
+                add("split", [primary, picks[0]], t, slot_end)
             t = slot_end
-            gap_ptr  += 1
-            last_primary = primary
-        if t < t_end and timeline:
-            timeline[-1] = dict(timeline[-1], end=t_end)
+        cycle_pos[primary] = step_i
 
-    # Walk through all merged real-speaker windows + gaps between them
-    prev_primary = None
+    def emit_uncertain(t0, t1, cands):
+        """Show the likely speakers together; alternate double ↔ triple on long
+        turns so the frame keeps moving."""
+        t, flip = t0, 0
+        while t < t1 - 1e-6:
+            slot_end = min(t + CAROUSEL_DUR * 1.5, t1)
+            if t1 - slot_end < MIN_SEGMENT:
+                slot_end = t1
+            here = [k for k in cands if present_during(k, t, slot_end)] or cands[:1]
+            extra = [k for k in present_at(t) if k not in here and present_during(k, t, slot_end)]
+            if len(here) >= 3:
+                shot = here[:3] if flip % 2 == 0 else here[:2]
+            elif len(here) == 2 and extra and flip % 2 == 1 and t1 - t0 > 2 * CAROUSEL_DUR:
+                shot = here + [extra[sec_idx["_u"] % len(extra)]]; sec_idx["_u"] += 1
+            else:
+                shot = here[:2]
+            if len(shot) == 1:
+                mates = [k for k in extra]
+                shot = shot + ([mates[sec_idx["_u"] % len(mates)]] if mates else [])
+                sec_idx["_u"] += 1
+            add(kind_for(len(shot)), shot, t, slot_end)
+            t = slot_end; flip += 1
+
+    def emit_gap_carousel(t0, t1):
+        """No one is (mappably) talking. INVARIANT: never hold a static single —
+        rotate through the PRESENT seats, alternating a brief single with a
+        split, regardless of diarization/mapping quality."""
+        t = t0
+        while t < t1 - 1e-6:
+            present = present_at(t) or [last_primary[0] if last_primary[0] in seats else seats[0]]
+            primary = present[gap_ptr[0] % len(present)]
+            solo_end = min(t + SOLO_INTRO_DUR, t1)
+            if t1 - solo_end < MIN_SEGMENT:
+                solo_end = t1
+            add("single", [primary], t, solo_end, gap=True)
+            t = solo_end
+            if t >= t1 - 1e-6:
+                break
+            slot_end = min(t + CAROUSEL_DUR, t1)
+            if t1 - slot_end < MIN_SEGMENT:
+                slot_end = t1
+            mates = [k for k in seats if k != primary and present_during(k, t, slot_end)]
+            rot = [mates[(gap_ptr[0] + i) % len(mates)] for i in range(len(mates))] if mates else []
+            if len(rot) >= 2 and gap_ptr[0] % 2 == 1:
+                add("triple", [primary] + rot[:2], t, slot_end, gap=True)
+            elif rot:
+                add("split", [primary, rot[0]], t, slot_end, gap=True)
+            else:
+                add("single", [primary], t, slot_end, gap=True)
+            t = slot_end
+            gap_ptr[0] += 1
+            last_primary[0] = primary
+
+    # ── walk turns + gaps ──
     t = 0.0
-
-    for seg in merged:
-        # Gap before this segment (broadcast audio / silence)
-        if seg["start"] > t + MIN_SEGMENT:
-            emit_gap_carousel(t, seg["start"])
-
-        # Clip start to t — pyannote can produce overlapping segments from different
-        # speakers; without this clip the timeline goes backwards and content repeats.
-        actual_start = max(seg["start"], t)
-        seg_dur = seg["end"] - actual_start
-
-        # Skip blip segments from speakers who have been inactive for > ACTIVITY_WINDOW.
-        # A short utterance from someone who left long ago is a pyannote misidentification;
-        # promoting them to primary would show their empty chair at the top of the frame.
-        is_blip_from_absent = (
-            seg_dur < MIN_ACTIVITY_DUR
-            and last_real_spoke_before(seg["speaker"], seg["start"]) < seg["start"] - ACTIVITY_WINDOW
-        )
-        if actual_start < seg["end"] - MIN_SEGMENT and not is_blip_from_absent:
-            is_new = seg["speaker"] != prev_primary
-            emit_window(actual_start, seg["end"], seg["speaker"], is_new)
-            prev_primary = seg["speaker"]
-        t = max(t, seg["end"])  # never let t go backwards
-
-    # Tail gap after last real segment
-    if t < video_end - MIN_SEGMENT:
+    prev = None
+    for a, b, primary, mean, ovl, sure in turns:
+        t0, t1 = a * step, min(b * step, video_end)
+        if t0 - t >= MIN_SEGMENT:
+            emit_gap_carousel(t, t0)
+        elif timeline and t0 > t:
+            timeline[-1]["end"] = t0
+        t0 = max(t0, t)
+        if t1 - t0 < 1e-3:
+            continue
+        conf = mean.get(primary, 0.0)
+        ranked = sorted((k for k in mean if mean[k] >= CAND_MIN_P), key=lambda k: -mean[k])
+        if primary in ranked:
+            ranked.remove(primary)
+        cands = ([primary] + ranked)[:3]
+        if ovl >= 0.5 and len(cands) < 2:
+            others = sorted((k for k in mean if k != primary), key=lambda k: -mean[k])
+            cands += others[:1]
+        if (sure and conf >= CONF_HI * 0.9 and ovl < 0.5) or len(cands) < 2:
+            emit_confident(t0, t1, primary, primary != prev)
+            if prev and primary != prev:
+                last_primary_end[prev] = t0
+            prev = primary
+            last_primary[0] = primary
+        else:
+            emit_uncertain(t0, t1, cands)
+            prev = None
+        t = t1
+    if video_end - t >= MIN_SEGMENT:
         emit_gap_carousel(t, video_end)
+    elif timeline:
+        timeline[-1]["end"] = video_end
 
-    # ── Make the timeline GAP-FREE ────────────────────────────────────────────
-    # emit_window/emit_gap_carousel skip sub-MIN_SEGMENT slivers and leave small
-    # gaps at diarization-segment boundaries. Those spans are never rendered, so
-    # the output ends up shorter than the video AND the (per-segment-seeked) audio
-    # skips at every hole. Absorb each gap into the preceding shot so the timeline
-    # tiles [0, video_end] continuously: end[i] := start[i+1], last end := video_end.
+    # ── gap-free tiling of [0, video_end] ──
     timeline.sort(key=lambda s: s["start"])
     cleaned = []
     for shot in timeline:
-        if cleaned and shot["start"] < cleaned[-1]["end"] - 0.001:
-            continue  # fully overlapped by previous shot — drop
+        if cleaned and shot["start"] < cleaned[-1]["end"] - 1e-3:
+            continue
         cleaned.append(shot)
     for i in range(len(cleaned) - 1):
         cleaned[i] = dict(cleaned[i], end=cleaned[i + 1]["start"])
     if cleaned:
+        cleaned[0] = dict(cleaned[0], start=0.0)
         cleaned[-1] = dict(cleaned[-1], end=max(cleaned[-1]["end"], video_end))
-    cleaned = [s for s in cleaned if s["end"] - s["start"] > 0.01]
+    # merge sub-MIN_SEGMENT slivers into their neighbour
+    merged = []
+    for s in cleaned:
+        if merged and s["end"] - s["start"] < MIN_SEGMENT:
+            merged[-1] = dict(merged[-1], end=s["end"])
+        else:
+            merged.append(s)
+    return [s for s in merged if s["end"] - s["start"] > 0.01]
 
-    return cleaned
+
+# ── Render ────────────────────────────────────────────────────────────────────
 
 def render(video_path, output_path="output/final.mp4", end_time=None, external_audio=None):
-    os.makedirs("output", exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     segments_dir = tempfile.mkdtemp(prefix="360autocam_segs_")
     try:
-      _render_inner(video_path, output_path, end_time, external_audio, segments_dir)
+        _render_inner(video_path, output_path, end_time, external_audio, segments_dir)
     finally:
-      shutil.rmtree(segments_dir, ignore_errors=True)
+        shutil.rmtree(segments_dir, ignore_errors=True)
 
 
 def _render_inner(video_path, output_path, end_time, external_audio, segments_dir):
-    # Auto-detect aligned external audio if not explicitly provided
     if external_audio is None and os.path.exists("data/external_audio_aligned.wav"):
         external_audio = "data/external_audio_aligned.wav"
         print(f"Using external audio: {external_audio}")
 
-    positions   = load_json("data/speaker_positions.json")
-    diarization = load_json("data/diarization.json")
-
-    map_path = "data/speaker_map.json"
-    if os.path.exists(map_path):
-        speaker_map = load_json(map_path)
-    else:
-        diar_spk = sorted(set(s["speaker"] for s in diarization))
-        pos_spk  = sorted(positions.keys())
-        if len(diar_spk) == len(pos_spk):
-            speaker_map = dict(zip(diar_spk, pos_spk))
-            print(f"Auto-mapped: {speaker_map}")
-            print("If wrong, create data/speaker_map.json manually.")
-        else:
-            print(f"Diarization: {len(diar_spk)} speakers — {diar_spk}")
-            print(f"Positions:   {len(pos_spk)} speakers — {pos_spk}")
-            print("Create data/speaker_map.json to map them manually.")
-            sys.exit(1)
-
-    speaker_to_pos = {}
+    positions   = load_positions()
+    diarization = load_json("data/diarization.json") if os.path.exists("data/diarization.json") else []
+    speaker_map = load_json("data/speaker_map.json") if os.path.exists("data/speaker_map.json") else {}
+    overlaps    = load_json("data/overlaps.json") if os.path.exists("data/overlaps.json") else []
     for d, p in speaker_map.items():
         if p not in positions:
-            print(f"Error: speaker_map.json maps '{d}' → '{p}', "
-                  f"but '{p}' is not in speaker_positions.json.\n"
-                  f"Available positions: {sorted(positions)}")
+            print(f"Error: speaker_map.json maps '{d}' → '{p}', but '{p}' is not in "
+                  f"speaker_positions.json. Available: {sorted(positions)}")
             sys.exit(1)
-        speaker_to_pos[d] = positions[p]
-    if not speaker_to_pos:
-        print("Error: speaker_map.json contains no valid speaker-to-position mappings. "
-              "Check data/speaker_map.json.")
-        sys.exit(1)
 
-    # Diagnostic: show how much each mapped speaker speaks
-    from collections import Counter
-    spk_dur = Counter()
-    for seg in diarization:
-        spk_dur[seg["speaker"]] += seg["end"] - seg["start"]
-    total_dur = sum(spk_dur.values()) or 1
-    print("Speaker speech time:")
-    for spk, pos_key in speaker_map.items():
-        dur = spk_dur.get(spk, 0)
-        print(f"  {spk} → {pos_key}  {dur:.1f}s  ({100*dur/total_dur:.1f}% of speech)", flush=True)
-
-    overlaps = []
-    ovlp_path = "data/overlaps.json"
-    if os.path.exists(ovlp_path):
-        overlaps = load_json(ovlp_path)
-        print(f"Loaded {len(overlaps)} OSD overlap intervals from {ovlp_path}")
-
-    # Physical-presence-over-time (data/presence.json from step 2b), keyed by
-    # speaker label so the carousel can gate splits on who is actually present.
+    # fine presence (0.5s, from the 12.5fps mouth-tracking pass) beats the coarse
+    # frame-scan presence: it notices someone leaving within seconds
     presence = None
-    pres_path = "data/presence.json"
-    if os.path.exists(pres_path):
-        raw_pres = load_json(pres_path)
-        interval = raw_pres.get("interval", 10) or 10
-        by_speaker = {}
-        for spk, pos_key in speaker_map.items():
-            times = raw_pres.get("positions", {}).get(pos_key)
-            if times is not None:
-                by_speaker[spk] = set(int(round(t / interval)) for t in times)
-        presence = {"interval": interval,
-                    "num_frames": raw_pres.get("num_frames", 0),
-                    "by_speaker": by_speaker}
-        print(f"Loaded presence for {len(by_speaker)} speakers from {pres_path}")
-    else:
-        print("No data/presence.json — carousel will use speech-recency presence proxy.")
+    for pp in ("data/presence_fine.json", "data/presence.json"):
+        if os.path.exists(pp):
+            presence = load_json(pp)
+            print(f"Presence: {pp}")
+            break
+    if not presence:
+        print("No data/presence.json — everyone treated as present.")
 
-    # Get video duration for gap-fill coverage to end of recording
+    step, steps = load_speaker_steps(positions, diarization, speaker_map, overlaps)
+
     dur_result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", video_path],
         capture_output=True, text=True)
-    video_dur = float(dur_result.stdout.strip()) if dur_result.returncode == 0 else None
-
-    # Video frame rate — needed to frame-align segment durations (see below).
+    video_dur = float(dur_result.stdout.strip())
     fps_res = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1",
@@ -535,67 +581,82 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
         fps = float(num) / float(den)
     except Exception:
         fps = 30.0
-    print(f"Video frame rate: {fps:.3f} fps")
+    print(f"Video: {video_dur:.1f}s at {fps:.3f} fps; lens FOV {geometry.lens_fov():.1f}°")
 
-    timeline = resolve_timeline(diarization, speaker_to_pos,
-                                video_duration=video_dur, overlaps=overlaps,
-                                presence=presence)
-    if end_time is not None:
-        clipped = []
-        for s in timeline:
-            if s["start"] >= end_time:
-                continue
-            if s["end"] > end_time:
-                s = dict(s, end=end_time)
-            clipped.append(s)
-        timeline = clipped
+    video_end = min(video_dur, end_time) if end_time else video_dur
+    timeline = resolve_timeline(steps, step, positions.keys(), video_end, presence)
 
-    # ── Frame-align all boundaries (CRITICAL for A/V sync) ─────────────────────
-    # ffmpeg's -t rounds a segment UP to the frame covering its end (~+0–½ frame,
-    # always positive). Summed over hundreds of segments that bias drifts the
-    # video against the single continuous audio track by several seconds. Snapping
-    # every boundary to the frame grid makes each segment an exact whole number of
-    # frames → -t is exact → durations sum exactly → audio stays locked. Shared
-    # boundaries snap identically, so the timeline stays gap-free.
+    # ── Frame-align all boundaries (CRITICAL for A/V sync) ──
+    # ffmpeg's -t rounds a segment UP to the frame covering its end. Summed over
+    # hundreds of segments that drifts video against the single continuous audio
+    # track. Snapping every boundary to the frame grid makes durations exact.
     def _snap(t):
         return round(t * fps) / fps
     snapped = []
     for s in timeline:
         b = _snap(s["end"])
-        a = snapped[-1]["end"] if snapped else _snap(s["start"])  # force contiguity
-        if b - a >= 0.5 / fps:                      # ≥ ~half a frame → keep
+        a = snapped[-1]["end"] if snapped else _snap(s["start"])
+        if b - a >= 0.5 / fps:
             snapped.append(dict(s, start=a, end=b))
-        elif snapped and b > snapped[-1]["end"]:    # sub-frame → absorb into previous
+        elif snapped and b > snapped[-1]["end"]:
             snapped[-1] = dict(snapped[-1], end=b)
     timeline = snapped
 
-    real   = sum(1 for s in timeline if not s.get("gap_fill"))
-    fills  = sum(1 for s in timeline if s.get("gap_fill"))
-    splits = sum(1 for s in timeline if s["type"] == "split")
-    print(f"Timeline: {len(timeline)} shots ({real} speech, {fills} gap-fill holds, {splits} split-screen)")
+    kinds = defaultdict(float)
+    for s in timeline:
+        kinds[s["type"]] += s["end"] - s["start"]
+    total = sum(kinds.values()) or 1
+    longest_single = max([s["end"] - s["start"] for s in timeline if s["type"] == "single"] or [0])
+    print(f"Timeline: {len(timeline)} shots — " +
+          ", ".join(f"{k} {100 * v / total:.0f}%" for k, v in sorted(kinds.items())) +
+          f"; longest single {longest_single:.1f}s", flush=True)
+    with open("data/timeline.json", "w") as f:
+        json.dump(timeline, f, indent=1)
 
-    # ── Encode segments (v360 per segment, N_RENDER_WORKERS parallel) ───────────
+    framer = Framer(positions)
     print(f"Encoding {len(timeline)} segments with {N_RENDER_WORKERS} workers…", flush=True)
 
-    def encode_shot(args):
-        i, shot = args
-        out = os.path.join(segments_dir, f"seg_{i:05d}.mp4")
-        if shot["type"] == "single":
-            extract_segment(video_path, speaker_to_pos[shot["speakers"][0]],
-                            shot["start"], shot["end"], out,
-                            external_audio=external_audio)
+    for i, shot in enumerate(timeline):
+        spk = framer.dedupe(shot["speakers"], shot["start"], shot["end"])
+        if len(spk) != len(shot["speakers"]):
+            timeline[i] = dict(shot, speakers=spk, type={1: "single", 2: "split", 3: "triple"}[len(spk)])
+
+    # Back-to-back shots of the same people are ONE shot: cutting between them and
+    # re-aiming each half separately makes the picture visibly twitch.
+    joined = []
+    for shot in timeline:
+        if joined and joined[-1]["speakers"] == shot["speakers"]:
+            joined[-1] = dict(joined[-1], end=shot["end"])
         else:
-            extract_split_segment(video_path,
-                                  speaker_to_pos[shot["speakers"][0]],
-                                  speaker_to_pos[shot["speakers"][1]],
-                                  shot["start"], shot["end"], out,
-                                  external_audio=external_audio)
+            joined.append(dict(shot))
+    if len(joined) != len(timeline):
+        print(f"  merged {len(timeline) - len(joined)} cuts between identical shots", flush=True)
+    timeline = joined
+    with open("data/timeline.json", "w") as f:
+        json.dump(timeline, f, indent=1)
+
+    # Aim every pane up front, sequentially, so a person who stays on screen
+    # across a cut keeps their exact crop unless their face really moved.
+    shot_views = []
+    held = {}                                  # (seat, pane_h) → (view, end_time)
+    for shot in timeline:
+        views = framer.views(shot["speakers"], shot["start"], shot["end"])
+        for j, seat in enumerate(shot["speakers"]):
+            key = (seat, views[j][4], views[j][5])
+            prev = held.get(key)
+            if prev and abs(prev[1] - shot["start"]) < 1e-3 and same_framing(prev[0], views[j]):
+                views[j] = prev[0]
+            held[key] = (views[j], shot["end"])
+        shot_views.append(views)
+
+    def job(i, shot):
+        out = os.path.join(segments_dir, f"seg_{i:05d}.mp4")
+        encode_shot(video_path, shot_views[i], shot["start"], shot["end"], out)
         return i, out
 
-    clips_map = {}
-    done = 0
+    clips_map, done = {}, 0
     with ThreadPoolExecutor(max_workers=N_RENDER_WORKERS) as pool:
-        futures = {pool.submit(encode_shot, (i, shot)): i for i, shot in enumerate(timeline)}
+        futures = {pool.submit(job, i, shot): i for i, shot in enumerate(timeline)}
         for fut in as_completed(futures):
             try:
                 i, out = fut.result()
@@ -608,59 +669,33 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
             print(f"[{done}/{len(timeline)}]", flush=True)
 
     clips = [clips_map[i] for i in range(len(timeline))]
-
     print(f"\nConcatenating {len(clips)} clips...")
     concat_list = os.path.join(segments_dir, "concat.txt")
     with open(concat_list, "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
-
-    # 1) Join the video-only segments into one silent, full-length video.
     silent_video = os.path.join(segments_dir, "video_only.mp4")
-    subprocess.run([
-        "ffmpeg", "-f", "concat", "-safe", "0",
-        "-i", concat_list,
-        "-c", "copy", "-an",
-        silent_video, "-y"
-    ], check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat_list,
+                    "-c", "copy", "-an", silent_video, "-y"], check=True)
 
-    # 2) Lay ONE continuous audio track over it in a single encode → gapless.
-    #    Output time 0 == camera time timeline[0].start, so the audio (which is on
-    #    the camera/aligned timeline) is seeked to that same offset.
+    # ONE continuous audio track over the whole video (gapless). Output time 0 ==
+    # camera time timeline[0].start; video is the master clock (apad + shortest).
     t0 = timeline[0]["start"] if timeline else 0.0
     audio_src = external_audio if external_audio else (
-        "data/audio.wav" if os.path.exists("data/audio.wav") else None)
-
-    # The VIDEO is the master clock: -af apad pads the audio with silence if it
-    # runs short, and -shortest then trims the result to the exact video length,
-    # so the output is always video-length with A/V kept in sync.
-    if audio_src and os.path.exists(audio_src):
-        print(f"Overlaying continuous audio from {audio_src} (offset {t0:.2f}s)…")
-        subprocess.run([
-            "ffmpeg",
-            "-i", silent_video,
-            "-ss", f"{t0:.6f}", "-i", audio_src,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-af", "apad",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            output_path, "-y"
-        ], check=True)
-    else:
-        # No audio source available — fall back to the camera's own audio track.
-        print(f"No separate audio track; pulling camera audio from the video (offset {t0:.2f}s)…")
-        subprocess.run([
-            "ffmpeg",
-            "-i", silent_video,
-            "-ss", f"{t0:.6f}", "-i", video_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-af", "apad",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            output_path, "-y"
-        ], check=True)
-
+        "data/audio.wav" if os.path.exists("data/audio.wav") else video_path)
+    print(f"Overlaying continuous audio from {audio_src} (offset {t0:.2f}s)…")
+    subprocess.run([
+        "ffmpeg", "-v", "error",
+        "-i", silent_video,
+        "-ss", f"{t0:.6f}", "-i", audio_src,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-af", "apad",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        output_path, "-y"
+    ], check=True)
     print(f"Done! Output: {output_path}")
+
 
 if __name__ == "__main__":
     import argparse
@@ -668,7 +703,7 @@ if __name__ == "__main__":
     parser.add_argument("video_path")
     parser.add_argument("output_path", nargs="?", default="output/final.mp4")
     parser.add_argument("--end-time", type=float, default=None,
-                        help="Only render segments starting before this time (seconds)")
+                        help="Only render up to this time (seconds)")
     parser.add_argument("--external-audio", default=None,
                         help="Aligned external mic WAV to use instead of camera audio "
                              "(auto-detected from data/external_audio_aligned.wav if present)")

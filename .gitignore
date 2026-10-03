@@ -33,3 +33,7 @@ __pycache__/
 app/node_modules/
 app/dist/
 app/package-lock.json
+
+# packaged-app bundle (built by app/build/bundle.sh)
+app/bundle/
+app/build/.cache/

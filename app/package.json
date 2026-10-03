@@ -1,11 +1,13 @@
 {
   "name": "360autocam",
   "version": "1.0.0",
-  "description": "Auto-cut 360° Insta360 video into 9:16 vertical with speaker switching",
+  "description": "Auto-cut 360\u00b0 Insta360 video into 9:16 vertical with speaker switching",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --mac"
+    "build": "electron-builder --mac",
+    "bundle": "./build/bundle.sh",
+    "dist": "./build/bundle.sh && electron-builder --mac"
   },
   "build": {
     "appId": "com.akouris.360autocam",
@@ -14,32 +16,87 @@
       "category": "public.app-category.video",
       "icon": "resources/icon.icns",
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
-      "minimumSystemVersion": "11.0",
+      "minimumSystemVersion": "12.0",
       "hardenedRuntime": false,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "identity": null
     },
     "dmg": {
       "title": "360 AutoCam",
-      "window": { "width": 540, "height": 380 }
+      "window": {
+        "width": 540,
+        "height": 380
+      }
     },
     "extraResources": [
-      { "from": "../0_extract_audio.py",   "to": "scripts/0_extract_audio.py"   },
-      { "from": "../1_extract_frames.py",  "to": "scripts/1_extract_frames.py"  },
-      { "from": "../2_detect_speakers.py", "to": "scripts/2_detect_speakers.py" },
-      { "from": "../2b_detect_presence.py","to": "scripts/2b_detect_presence.py"},
-      { "from": "../3_diarize.py",         "to": "scripts/3_diarize.py"         },
-      { "from": "../3_automap.py",         "to": "scripts/3_automap.py"         },
-      { "from": "../4_render.py",          "to": "scripts/4_render.py"          },
-      { "from": "../5_sync_audio.py",      "to": "scripts/5_sync_audio.py"      },
-      { "from": "resources/requirements.txt", "to": "requirements.txt"          }
+      {
+        "from": "../geometry.py",
+        "to": "scripts/geometry.py"
+      },
+      {
+        "from": "../0_extract_audio.py",
+        "to": "scripts/0_extract_audio.py"
+      },
+      {
+        "from": "../1_extract_frames.py",
+        "to": "scripts/1_extract_frames.py"
+      },
+      {
+        "from": "../2_detect_speakers.py",
+        "to": "scripts/2_detect_speakers.py"
+      },
+      {
+        "from": "../2b_detect_presence.py",
+        "to": "scripts/2b_detect_presence.py"
+      },
+      {
+        "from": "../3_diarize.py",
+        "to": "scripts/3_diarize.py"
+      },
+      {
+        "from": "../3_automap.py",
+        "to": "scripts/3_automap.py"
+      },
+      {
+        "from": "../4_render.py",
+        "to": "scripts/4_render.py"
+      },
+      {
+        "from": "../5_sync_audio.py",
+        "to": "scripts/5_sync_audio.py"
+      },
+      {
+        "from": "bundle/python",
+        "to": "python"
+      },
+      {
+        "from": "bundle/bin",
+        "to": "bin"
+      },
+      {
+        "from": "bundle/models",
+        "to": "models"
+      }
     ],
     "files": [
       "main.js",
       "preload.js",
       "renderer/**"
-    ]
+    ],
+    "afterPack": "build/adhoc-sign.js"
   },
   "devDependencies": {
     "electron": "^28.3.0",

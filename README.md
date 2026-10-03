@@ -16,7 +16,9 @@ Place the camera on the table. Everyone sits around it. The pipeline figures out
 
 - **Presence-driven carousel** — the output continuously cycles between single shots and split-screens of whoever is **physically present**, driven by per-frame face detection. It never freezes on a static shot and never shows an empty chair for someone who has left the room — this holds even if diarization or speaker mapping is imperfect.
 - **Split-screen first** — the default shot shows the speaker + another present participant; brief solo intros mark genuine speaker changes
-- **Automatic speaker mapping** — lip-sync correlation (MediaPipe + audio RMS) matches diarization IDs to camera positions; no manual labelling
+- **Audio + video speaker detection** — every face's mouth is tracked at 12.5 fps and checked against the audio for every diarized segment, so the camera follows who is *visibly* talking, not just a voice label
+- **Double / triple shots when unsure** — when it can't tell who is speaking (or two people talk at once) it shows the likely speakers together instead of guessing wrong
+- **Accurate framing** — each pane follows the face's real position, is zoomed by face size, and keeps the face in the upper part of the frame; crops come from the stitched 360° view, so people sitting on the lens seam frame correctly
 - **External mic support** — feed in a console mix or direct mic recording; the pipeline auto-syncs it to the camera and lays it over the final video as the high-quality audio track
 - **Smooth, in-sync audio** — one continuous audio track encoded once (no per-cut glitches), with cut boundaries frame-aligned so audio and video never drift apart
 - **Hardware-accelerated encoding** — VideoToolbox HEVC on Apple Silicon
@@ -35,13 +37,32 @@ npm install
 npm start
 ```
 
-On first launch the app detects your Python environment and walks through dependency installation if needed. Output lands in `autocam_<videoname>/` next to your input file.
+In development (`npm start`) the app uses `app/bundle` if you've built it, otherwise the project `venv`. Output lands in `autocam_<videoname>/` next to your input file.
 
-To build a distributable `.app` / DMG:
+### Building the self-contained app (for other Macs)
+
+The packaged app carries everything it needs: standalone Python 3.9 with the exact tested packages (`app/resources/requirements.lock.txt`), static arm64 `ffmpeg`/`ffprobe`, the face model and the pyannote weights. It runs offline on any Apple Silicon Mac (M1 or newer, macOS 12+; 16 GB RAM recommended) with no Homebrew, no Python and no Hugging Face token.
 
 ```bash
-npm run build   # → dist/360 AutoCam-1.0.0-arm64.dmg
+cd app
+npm install
+npm run dist    # = ./build/bundle.sh (assemble app/bundle) + electron-builder
+# → dist/360 AutoCam-1.0.0-arm64.dmg and dist/360 AutoCam-1.0.0-arm64-mac.zip (~480 MB each)
 ```
+
+`build/bundle.sh` needs the pyannote weights in `~/.cache/torch/pyannote` (run the pipeline from source once with `HF_TOKEN` set). The app is **ad-hoc signed** (`build/adhoc-sign.js`) — free, no Apple Developer ID. Python bytecode is pre-compiled and sealed, and the app runs Python with `PYTHONDONTWRITEBYTECODE=1`, so using it never breaks its signature.
+
+### Distributing without a Developer ID
+
+macOS only blocks un-notarized apps that carry the "downloaded from the internet" mark (browsers, Mail, Messages, AirDrop add it; `curl`, USB sticks and most network shares don't).
+
+- **Recommended — one-line install.** Put the zip and `app/build/install.sh` somewhere reachable (for Dropbox, use `?dl=1` links). Colleagues paste:
+  ```bash
+  curl -fsSL "<install.sh link>" | bash -s "<zip link>"
+  ```
+  It installs to /Applications, verifies the signature and opens the app — no prompts.
+- **DMG/zip via a browser link:** the first launch is blocked once. Fix with System Settings → Privacy & Security → **Open Anyway**, or in Terminal:
+  `xattr -dr com.apple.quarantine "/Applications/360 AutoCam.app"`
 
 ### Option B — Command line
 
@@ -72,7 +93,7 @@ Output: `output/final.mp4`
 > mic **before** the expensive frame work, so an audio problem (no audio track,
 > wrong/non-overlapping mic file) fails in seconds instead of after minutes.
 
-The diarization model requires a free Hugging Face account and accepted terms:
+Only needed when running from source (the packaged app ships the models). The diarization model requires a free Hugging Face account and accepted terms:
 
 1. Create an account at [huggingface.co](https://huggingface.co)
 2. Accept the terms for [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
@@ -118,31 +139,38 @@ Steps run in this order (audio first, then frames, then analysis):
 |------|--------|--------|------------------------|
 | 0 | `0_extract_audio.py` | `data/audio.wav` — camera audio (16 kHz mono) | ~30 sec |
 | 0b *(optional)* | `5_sync_audio.py` | `data/external_audio_aligned.wav` | ~1 min |
-| 1 | `1_extract_frames.py` | `frames/` — one frame every 10s | ~1 min |
-| 2 | `2_detect_speakers.py` | `data/speaker_positions.json` — yaw/pitch/fov per speaker | ~30 sec |
-| 2b | `2b_detect_presence.py` | `data/presence.json` — per-time face presence per seat | ~1 min |
+| 1 | `1_extract_frames.py` | `frames/` — one frame every 2s; `data/lens.json` — calibrated lens FOV | ~2 min |
+| 2 | `2_detect_speakers.py` | `data/speaker_positions.json` (seats) + `data/face_tracks.json` (faces per frame) | ~2 min |
+| 2b | `2b_detect_presence.py` | `data/presence.json` — per-time face presence per seat | seconds |
 | 3 | `3_diarize.py` | `data/diarization.json` + `data/overlaps.json` | ~12 min |
-| 3b | `3_automap.py` | `data/speaker_map.json` — diarization ID → camera position | ~5 min |
-| 4 | `4_render.py` | `output/final.mp4` | ~13 min |
+| 3b | `3_automap.py` | `data/speaker_probs.json` (who speaks, every 0.5s), `speaker_map.json`, `framing_tracks.json`, `presence_fine.json` | ~9 min |
+| 4 | `4_render.py` | `output/final.mp4` (+ `data/timeline.json`) | ~15 min |
 
-**Total: ~30–35 min for a 30-minute video on Apple M1.**
+Times measured on an Apple M4 by scaling a 74s test clip; the slow parts are diarization, mouth tracking and encoding.
 
 > **Audio roles:** all *analysis* (diarization + speaker mapping) runs on the
 > **camera audio**, which is intrinsically in sync with the video and cleaner for
 > this purpose. An external studio mic, if provided, is used **only** as the final
 > audio overlay in the render — never for analysis.
 
-### Presence detection (step 2b) and the carousel
+### Geometry (`geometry.py`)
 
-`2b_detect_presence.py` scans every extracted frame, takes a perspective crop at each known seat, and records whether a face is visible there — producing a smoothed, per-time presence track per seat (`data/presence.json`). The renderer uses this to drive the carousel: the secondary slot only ever shows a seat whose occupant is currently present, and during stretches with no clearly-mapped speaker it rotates the primary through the present seats. This guarantees the output never holds a static single shot and never shows an empty chair — independent of diarization/mapping quality.
+All angle ↔ pixel math lives in one module shared by detection (Python) and rendering (FFmpeg `v360`), verified to agree pixel-for-pixel. Both lenses are stitched (`v360=dfisheye`), so yaw is one global frame: 0° = front lens, 180° = back lens. Insta360 lenses cover ~190–197°, not 180°; step 1 measures the real FOV per video by making the lens seams line up, and every later step uses it.
 
-### How speaker mapping works
+### Seats, presence and the carousel (steps 2 / 2b)
 
-`3_automap.py` samples short segments for each diarized speaker, extracts camera frames at each seat, measures lip aperture with MediaPipe FaceLandmarker, and correlates that against the audio RMS envelope. Broadcast/background audio (studio monitors, music) is identified by lip-sync, not duration: a "speaker" whose audio doesn't move *any* on-camera mouth (correlation below threshold) is excluded as broadcast. The busiest real speakers seed the seats 1-to-1 (Hungarian), then any extra diarization labels (pyannote often over-segments one person into several) attach to their best-matching seat. Diarization's speaker count is also capped using the number of detected faces, to bound over-segmentation on noisy audio.
+Step 2 runs MediaPipe all the way round the 360° view on every frame. Seats are peaks in the yaw distribution of faces, so two people sitting close together stay separate. Background people (much smaller faces), static faces (posters, a face on a monitor) and faces seen too rarely are rejected. Presence (who is physically there, over time) comes from these face tracks, tightened by the 12.5 fps mouth-tracking pass in step 3b, so someone who walks off drops out within seconds. The renderer only ever shows present people, and with no clear speaker it rotates through them — it never holds a static single shot and never shows an empty chair, independent of diarization quality.
 
-> **Note:** lip-sync correlation can be weak on far-field / studio footage. If seats
-> look mis-assigned, override `data/speaker_map.json` manually (see below). The
-> presence-driven carousel still produces a watchable result regardless.
+### How speaker detection works (step 3b)
+
+1. **Mouth tracking** — one pass over the video at 12.5 fps renders a tight crop per seat (faces ~100px) and measures mouth openness (inner-lip gap ÷ face height, plus MediaPipe's `jawOpen`). A face only counts for a seat if it's nearer that seat than any other, so a neighbour leaning in can't hijack it.
+2. **Per-segment evidence** — for *every* diarized segment, each seat is scored by how well its mouth movement tracks the audio loudness (±240 ms lag search) and how much the mouth moves compared with everyone at the table.
+3. **Label → seat** — each diarization label is mapped by pooling all its segments. Labels that never move any on-camera mouth (music, phone-ins, broadcast audio) are off-camera and ignored.
+4. **Speaker probabilities** — every 0.5s, a probability per seat combines the label's seat with the local mouth evidence. When diarization lumps two people under one label, the mouth evidence still picks out who is talking.
+
+### How shots are chosen (step 4)
+
+Three layouts: **single** (one person, full frame), **split** (two stacked halves) and **triple** (the speaker on the top half, two people side by side in the bottom half). Turns are found by Viterbi smoothing with a switch penalty, so a one-second "yeah" doesn't cut the camera (the interjector gets a pane instead). A **confident** turn gets a 2s solo intro, then cycles split → triple → split → single (triples only when 3+ people are present; a scheduled single becomes a split if someone is chiming in). An **uncertain** stretch shows the 2 or 3 likely speakers together (double / triple shot, alternating on long stretches), and **overlapping speech** shows the overlapping people together. The full shot list is written to `data/timeline.json`.
 
 ### External audio sync
 
@@ -152,17 +180,16 @@ Steps run in this order (audio first, then frames, then analysis):
 
 ## Manual overrides
 
-If `3_automap.py` gets the assignment wrong (weak lip-sync, far-field/studio audio, or a very quiet speaker), edit `data/speaker_map.json` directly before running the render:
+If a diarization label is tied to the wrong person, create `data/speaker_map_manual.json` and re-run step 3b (it reuses the cached mouth tracks, so it takes seconds) and then the render:
 
 ```json
 {
-  "SPEAKER_00": "front_0",
-  "SPEAKER_01": "front_1",
-  "SPEAKER_02": "back_0"
+  "SPEAKER_00": "seat_0",
+  "SPEAKER_01": "seat_2"
 }
 ```
 
-Keys are pyannote speaker IDs; values are keys from `data/speaker_positions.json`. Several diarization IDs may map to the same seat (that's expected when one person is over-segmented into multiple IDs).
+Keys are pyannote speaker IDs; values are keys from `data/speaker_positions.json` (seats are numbered by yaw). Several IDs may map to the same seat. Labels you leave out are treated as off-camera audio. Per-moment mouth evidence still applies on top of your map.
 
 ---
 
@@ -184,6 +211,7 @@ The render cuts only the **video** per shot; the audio is one continuous track l
 ```
 360-autocam/
 ├── run_all.sh               # CLI entry point
+├── geometry.py              # shared 360° geometry, lens calibration, framing
 ├── 0_extract_audio.py
 ├── 1_extract_frames.py
 ├── 2_detect_speakers.py
@@ -195,11 +223,17 @@ The render cuts only the **video** per shot; the audio is one continuous track l
 ├── data/
 │   ├── audio.wav                    # camera audio, extracted by step 0
 │   ├── external_audio_aligned.wav   # created by 5_sync_audio.py (optional)
-│   ├── speaker_positions.json       # created by step 2
-│   ├── presence.json                # created by step 2b
-│   ├── diarization.json             # created by step 3
-│   ├── overlaps.json                # created by step 3
-│   ├── speaker_map.json             # created by step 3b, editable
+│   ├── lens.json                    # calibrated lens FOV, step 1
+│   ├── speaker_positions.json       # seats, step 2
+│   ├── face_tracks.json             # faces per frame, step 2
+│   ├── presence.json                # step 2b
+│   ├── diarization.json             # step 3
+│   ├── overlaps.json                # step 3
+│   ├── mouth_tracks.npz             # 12.5 fps mouth/face tracks (cache), step 3b
+│   ├── speaker_probs.json           # who speaks, every 0.5s, step 3b
+│   ├── speaker_map.json             # label → seat, step 3b
+│   ├── speaker_map_manual.json      # optional hand override
+│   ├── timeline.json                # shot list, step 4
 │   └── face_landmarker.task         # download separately (see setup)
 ├── frames/                          # created by step 1
 ├── output/                          # final.mp4 lands here
@@ -214,11 +248,10 @@ The render cuts only the **video** per shot; the audio is one continuous track l
 
 ## Limitations & notes
 
-- **Speaker mapping depends on lip-sync**, which can be weak on far-field or
-  acoustically busy footage (e.g. a radio studio with monitors and music). When
-  it's uncertain, seats may be mis-assigned — override `data/speaker_map.json`
-  manually. The presence-driven carousel still produces a watchable result either
-  way (it shows the present people; only *which* speaker is emphasised may be off).
+- **Speaker detection needs visible mouths.** A face turned fully away, or a mic
+  covering the mouth, weakens the evidence. When it's unsure, the renderer shows
+  the likely speakers together rather than guessing; if a label is consistently
+  wrong, use `data/speaker_map_manual.json`.
 - **macOS / Apple Silicon focused.** Encoding uses VideoToolbox; diarization uses
   MPS. Intel Macs and other platforms work but are slower and untested here.
 - The external mic only improves the *audio*; if the mic recording doesn't cover

@@ -514,3 +514,6 @@ html, body {
   flex: 1;
   text-align: center;
 }
+
+/* generic toggle (token row, setup controls) */
+.hidden { display: none !important; }

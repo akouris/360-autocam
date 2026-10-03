@@ -1,332 +1,335 @@
 #!/usr/bin/env python3
 """
-Step 2: Detect faces and cluster by angular position.
+Step 2: Find every face in every extracted frame, then work out the SEATS.
 
-Extracts flat perspective crops from the fisheye using the equidistant
-projection model (same as FFmpeg v360=fisheye:flat), then runs MediaPipe
-FaceLandmarker on those crops. This avoids the fisheye distortion that
-makes Haar cascade give wrong positions.
+For each frame, rectilinear crops are sampled all the way round the 360° view
+(geometry.Panorama — both lenses, seam included) and MediaPipe FaceLandmarker
+runs on each. Every face becomes a detection with an exact global yaw/pitch,
+its angular size, and a mouth-open value.
+
+Seats are peaks in the circular yaw distribution of detections (people sitting
+close together give separate peaks instead of being averaged into the gap
+between them). Rejected as seats:
+  • background faces — much smaller than the people at the table
+  • static faces     — posters, logos, faces on a monitor (no expression change)
+  • rare faces       — seen in too few frames
+
+Outputs
+  data/speaker_positions.json  {seat_key: {yaw_degrees, pitch_degrees, face_deg, ...}}
+  data/face_tracks.json        per-seat face position/size in every frame
+                               (drives presence, framing and mouth tracking)
 
 Mode is read from VIDEO_MODE env var (default: fisheye).
 """
 
-import cv2, os, json, math, subprocess, sys, tempfile
+import cv2, os, json, math, sys
 import numpy as np
-from sklearn.cluster import DBSCAN
+from multiprocessing import Pool
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import geometry
 
 FACE_LANDMARKER_MODEL = os.environ.get(
     "FACE_LANDMARKER_MODEL",
-    os.path.join(os.path.dirname(__file__), "data", "face_landmarker.task"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "face_landmarker.task"),
 )
 
-# Sectors to scan per lens: yaw values (degrees) for perspective crop centres.
-# h_fov=75° per crop; these 5 sectors cover ±97.5° with heavy overlap.
-SECTORS    = [-60, -30, 0, 30, 60]
-CROP_H_FOV = 75   # degrees
-CROP_SIZE  = 640  # pixels (square crop)
+SECTOR_YAWS  = list(range(-180, 180, 30))   # 12 crops round the full circle
+CROP_FOV     = 75.0                          # heavy overlap between neighbours
+CROP_SIZE    = 640
+N_WORKERS    = max(1, min(4, (os.cpu_count() or 4) - 2))
 
-# Early-exit: stop scanning frames once clusters have been stable for N consecutive checks
-EARLY_EXIT_INTERVAL = 30   # check stability every N frames
-EARLY_EXIT_STABLE_N = 3    # require this many consecutive stable checks before stopping
+MIN_FACE_DEG       = 4.5    # faces smaller than this are background people …
+MIN_FACE_REL       = 0.45   # … or smaller than this × the typical table face
+MIN_SEAT_FRAC      = 0.06   # a seat must be occupied in ≥6% of frames …
+MIN_SEAT_FRAMES    = 3      # … and at least this many frames
+SEAT_MERGE_DEG     = 7.0    # peaks closer than this are one person
+SEAT_GATE_DEG      = 15.0   # max yaw distance from a seat for a detection to count
+SAME_PERSON_DEG    = 22.0   # nearby peaks this close may be one person who moved …
+CO_OCCUR_FRAC      = 0.2    # … if both are seen in the same frame less often than this
+STATIC_JAW_STD     = 0.006  # a face whose mouth never moves …
+STATIC_YAW_STD     = 0.35   # … and never moves at all, is a poster / screen
 
-_REMAP_CACHE: dict = {}    # (W, H, yaw, pitch, h_fov, out_size) → (map_x, map_y)
-
-
-# ── Equidistant fisheye → flat perspective remap ──────────────────────────────
-
-def _build_remap(fisheye_w, fisheye_h, yaw_deg, pitch_deg=0,
-                 h_fov_deg=CROP_H_FOV, out_size=CROP_SIZE):
-    """
-    Build cv2.remap map_x/map_y that extracts a rectilinear view from an
-    equidistant fisheye image (the projection that FFmpeg v360=fisheye uses).
-    fisheye circle is assumed to be inscribed in the image (radius = min(W,H)/2).
-    """
-    key = (fisheye_w, fisheye_h, yaw_deg, pitch_deg, h_fov_deg, out_size)
-    if key in _REMAP_CACHE:
-        return _REMAP_CACHE[key]
-
-    r_max   = min(fisheye_w, fisheye_h) / 2.0   # fisheye circle radius in pixels
-    cx, cy  = fisheye_w / 2.0, fisheye_h / 2.0
-
-    yaw   = math.radians(yaw_deg)
-    pitch = math.radians(pitch_deg)
-    hfov  = math.radians(h_fov_deg)
-    vfov  = hfov  # square crop → same vertical fov
-
-    # For each output pixel, compute the 3-D ray direction in the flat image
-    # and rotate it by (yaw, pitch).
-    out_xs = np.linspace(-hfov / 2, hfov / 2, out_size)
-    out_ys = np.linspace(-vfov / 2, vfov / 2, out_size)
-    ax, ay = np.meshgrid(out_xs, out_ys)   # horizontal / vertical angle grids
-
-    # Rectilinear ray (z points forward in the lens frame)
-    rx =  np.tan(ax)
-    ry = -np.tan(ay)
-    rz =  np.ones_like(ax)
-    norm = np.sqrt(rx**2 + ry**2 + rz**2)
-    rx, ry, rz = rx/norm, ry/norm, rz/norm
-
-    # Rotate ray by yaw (around Y axis) then pitch (around X axis)
-    # Yaw rotation
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    rx2 =  cos_y * rx + sin_y * rz
-    ry2 =  ry
-    rz2 = -sin_y * rx + cos_y * rz
-    # Pitch rotation
-    cos_p, sin_p = math.cos(pitch), math.sin(pitch)
-    rx3 = rx2
-    ry3 = cos_p * ry2 - sin_p * rz2
-    rz3 = sin_p * ry2 + cos_p * rz2
-
-    # Equidistant fisheye: theta = angle from optical axis; r = r_max * theta / (pi/2)
-    theta = np.arccos(np.clip(rz3, -1, 1))
-    # Negate ry3 so that the fisheye y-axis (y-down) maps correctly.
-    # Without this, the extracted crop is upside-down.
-    phi   = np.arctan2(-ry3, rx3)
-
-    r_px  = (r_max * theta) / (math.pi / 2)
-    map_x = (cx + r_px * np.cos(phi)).astype(np.float32)
-    map_y = (cy + r_px * np.sin(phi)).astype(np.float32)
-
-    _REMAP_CACHE[key] = (map_x, map_y)
-    return map_x, map_y
+# MediaPipe landmark indices
+FOREHEAD, CHIN = 10, 152
 
 
-def fisheye_to_flat(img, yaw_deg, pitch_deg=0, h_fov_deg=CROP_H_FOV, out_size=CROP_SIZE):
-    """Extract a flat perspective crop from a fisheye image."""
-    H, W = img.shape[:2]
-    mx, my = _build_remap(W, H, yaw_deg, pitch_deg, h_fov_deg, out_size)
-    return cv2.remap(img, mx, my, cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+def load_frame_meta():
+    try:
+        with open("frames/meta.json") as f:
+            return json.load(f)
+    except Exception:
+        return {"interval": float(os.environ.get("FRAME_INTERVAL", "10"))}
 
 
-# ── MediaPipe face detection ──────────────────────────────────────────────────
+def frame_files():
+    """Sorted frame names present for this mode."""
+    mode = geometry.video_mode()
+    d = "frames/equirect" if mode == "equirect" else "frames/front"
+    if not os.path.isdir(d):
+        return []
+    return sorted(f for f in os.listdir(d) if f.endswith(".jpg"))
 
-def _make_landmarker():
+
+def load_panorama(fname, fov=None):
+    if geometry.video_mode() == "equirect":
+        img = cv2.imread(os.path.join("frames/equirect", fname))
+        return None if img is None else geometry.Panorama(equirect=img)
+    fr = cv2.imread(os.path.join("frames/front", fname))
+    bk = cv2.imread(os.path.join("frames/back", fname))
+    if fr is None or bk is None:
+        return None
+    return geometry.Panorama(front=fr, back=bk, fov=fov)
+
+
+# ── MediaPipe ─────────────────────────────────────────────────────────────────
+
+def make_landmarker(num_faces=4, video=False):
     import mediapipe as mp
     opts = mp.tasks.vision.FaceLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL),
-        running_mode=mp.tasks.vision.RunningMode.IMAGE,
-        num_faces=4,
-        min_face_detection_confidence=0.3,
-        min_face_presence_confidence=0.3,
-        min_tracking_confidence=0.3,
+        running_mode=(mp.tasks.vision.RunningMode.VIDEO if video
+                      else mp.tasks.vision.RunningMode.IMAGE),
+        num_faces=num_faces,
+        output_face_blendshapes=True,
+        min_face_detection_confidence=0.35,
+        min_face_presence_confidence=0.35,
+        min_tracking_confidence=0.35,
     )
     return mp.tasks.vision.FaceLandmarker.create_from_options(opts)
 
 
-def detect_faces_on_flat_crop(crop_bgr, landmarker):
-    """Run MediaPipe on a perspective crop; return list of (cx_norm, cy_norm)."""
+def jaw_open(result, i):
+    try:
+        for c in result.face_blendshapes[i]:
+            if c.category_name == "jawOpen":
+                return float(c.score)
+    except Exception:
+        pass
+    return 0.0
+
+
+def faces_in_view(img_bgr, landmarker, yaw, pitch, h_fov, v_fov):
+    """Run FaceLandmarker on a rectilinear view; return faces in GLOBAL angles:
+    [{yaw, pitch, size, jaw, edge}] — size = forehead→chin angle in degrees,
+    edge = distance of the face from the view centre (0 = centre, 1 = corner)."""
     import mediapipe as mp
-    rgb    = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    result = landmarker.detect(mp_img)
-    faces  = []
-    for face in result.face_landmarks:
-        xs = [lm.x for lm in face]
-        ys = [lm.y for lm in face]
-        faces.append((float(np.mean(xs)), float(np.mean(ys))))
-    return faces
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    res = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    out = []
+    for i, lm in enumerate(res.face_landmarks):
+        xs = np.array([p.x for p in lm]); ys = np.array([p.y for p in lm])
+        u, v = float((xs.min() + xs.max()) / 2), float((ys.min() + ys.max()) / 2)
+        gy, gp = geometry.view_point_to_yaw_pitch(u, v, yaw, pitch, h_fov, v_fov)
+        ty, tp = geometry.view_point_to_yaw_pitch(lm[FOREHEAD].x, lm[FOREHEAD].y, yaw, pitch, h_fov, v_fov)
+        cy_, cp = geometry.view_point_to_yaw_pitch(lm[CHIN].x, lm[CHIN].y, yaw, pitch, h_fov, v_fov)
+        size = ang_dist(ty, tp, cy_, cp)
+        out.append({"yaw": gy, "pitch": gp, "size": size, "jaw": jaw_open(res, i),
+                    "edge": float(max(abs(u - 0.5), abs(v - 0.5)) * 2)})
+    return out
 
 
-# ── Per-lens scanning ─────────────────────────────────────────────────────────
+def ang_dist(y1, p1, y2, p2):
+    a1, b1, a2, b2 = map(math.radians, (y1, p1, y2, p2))
+    c = (math.sin(b1) * math.sin(b2) + math.cos(b1) * math.cos(b2) * math.cos(a1 - a2))
+    return math.degrees(math.acos(max(-1.0, min(1.0, c))))
 
-def scan_lens(frames_dir, lens_label, yaw_offset, stream, yaw_sign,
-              progress_offset=0, progress_total=None):
-    """
-    For each frame in frames_dir, extract perspective crops at SECTORS yaw values,
-    run MediaPipe, and record each detected face as (local_yaw, global_yaw, pitch).
 
-    progress_offset / progress_total: emit PROGRESS relative to a grand total
-    across all lenses so the progress bar never goes backward.
+def yaw_diff(a, b):
+    return abs(geometry.norm_yaw(a - b))
 
-    yaw_sign controls the back-lens horizontal mirror:
-      front lens:  yaw_sign = +1  (right in scene = positive local_yaw)
-      back lens:   yaw_sign = -1  (back faces opposite direction, so mirrored)
-    global_yaw = (yaw_offset + yaw_sign * local_yaw) % 360
-    """
-    frame_files = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
-    total      = len(frame_files)
-    prog_denom = progress_total if progress_total is not None else total
-    detections = []
 
-    print(f"Scanning {lens_label} lens: {total} frames × {len(SECTORS)} sectors…", flush=True)
+# ── Per-frame scan (parallel) ─────────────────────────────────────────────────
 
-    stable_count = 0
-    prev_centers: list | None = None
-    focal_norm = 0.5 / math.tan(math.radians(CROP_H_FOV / 2))
+_LM = None
+_FOV = None
 
-    with _make_landmarker() as lm:
-        for i, fname in enumerate(frame_files):
-            print(f"PROGRESS {progress_offset + i + 1}/{prog_denom}", flush=True)
-            img = cv2.imread(os.path.join(frames_dir, fname))
-            if img is None:
+
+def _init_worker(fov):
+    global _LM, _FOV
+    _LM = make_landmarker()
+    _FOV = fov
+
+
+def scan_frame(args):
+    idx, fname = args
+    pano = load_panorama(fname, _FOV)
+    if pano is None:
+        return idx, []
+    faces = []
+    for sy in SECTOR_YAWS:
+        crop = pano.view(sy, 0.0, CROP_FOV, CROP_FOV, CROP_SIZE, CROP_SIZE)
+        faces += faces_in_view(crop, _LM, sy, 0.0, CROP_FOV, CROP_FOV)
+    # the same face appears in 2–3 overlapping sectors: keep the most central copy
+    faces.sort(key=lambda f: f["edge"])
+    kept = []
+    for f in faces:
+        if all(ang_dist(f["yaw"], f["pitch"], k["yaw"], k["pitch"])
+               > max(3.0, 0.6 * max(f["size"], k["size"])) for k in kept):
+            kept.append(f)
+    return idx, kept
+
+
+# ── Seats ─────────────────────────────────────────────────────────────────────
+
+def circ_median(yaws):
+    """Median of angles (robust to wrap at ±180)."""
+    yaws = np.asarray(yaws, dtype=float)
+    ref = math.degrees(math.atan2(np.sin(np.radians(yaws)).mean(), np.cos(np.radians(yaws)).mean()))
+    return geometry.norm_yaw(ref + float(np.median([geometry.norm_yaw(y - ref) for y in yaws])))
+
+
+def find_seats(dets, num_frames):
+    """dets: list of (frame, face). Returns ({key: seat}, assignment list)."""
+    if not dets:
+        return {}, []
+    sizes = np.array([f["size"] for _, f in dets])
+    table_face = float(np.percentile(sizes, 75))
+    min_size = max(2.0, min(MIN_FACE_DEG, MIN_FACE_REL * table_face))
+    fg = [(i, f) for i, f in dets if f["size"] >= min_size]
+    print(f"  typical face {table_face:.1f}°, ignoring faces < {min_size:.1f}° "
+          f"({len(dets) - len(fg)} background detections)", flush=True)
+
+    # circular yaw histogram, 1° bins, Gaussian-smoothed (σ = 2.5°)
+    hist = np.zeros(360)
+    for _, f in fg:
+        hist[int(round(f["yaw"])) % 360] += 1
+    k = np.arange(-10, 11)
+    kern = np.exp(-0.5 * (k / 2.5) ** 2)
+    sm = np.array([sum(hist[(b + kk) % 360] * w for kk, w in zip(k, kern)) for b in range(360)])
+
+    peaks = [b for b in range(360)
+             if sm[b] > 0 and sm[b] >= sm[(b - 1) % 360] and sm[b] > sm[(b + 1) % 360]]
+    peaks.sort(key=lambda b: -sm[b])
+    centres = []
+    for b in peaks:
+        if all(yaw_diff(b, c) >= SEAT_MERGE_DEG for c in centres):
+            centres.append(float(b))
+
+    min_frames = max(MIN_SEAT_FRAMES, int(MIN_SEAT_FRAC * num_frames))
+
+    def assign(centres):
+        out = {c: [] for c in centres}
+        for i, f in fg:
+            near = sorted(centres, key=lambda c: yaw_diff(f["yaw"], c))
+            c = near[0]
+            gate = SEAT_GATE_DEG
+            if len(near) > 1:
+                gate = min(gate, 0.6 * yaw_diff(c, near[1]))
+            if yaw_diff(f["yaw"], c) <= gate:
+                out[c].append((i, f))
+        return out
+
+    # One person who shifts around makes two nearby peaks; two neighbours make two
+    # peaks that are seen IN THE SAME FRAMES. Merge nearby peaks that rarely co-occur.
+    groups = assign(centres)
+    merged_any = True
+    while merged_any and len(centres) > 1:
+        merged_any = False
+        frames_of = {c: {i for i, _ in groups[c]} for c in centres}
+        pairs = sorted(((yaw_diff(a, b), a, b) for ai, a in enumerate(centres)
+                        for b in centres[ai + 1:] if yaw_diff(a, b) < SAME_PERSON_DEG),
+                       key=lambda x: x[0])
+        for _, a, b in pairs:
+            fa, fb = frames_of[a], frames_of[b]
+            if not fa or not fb:
                 continue
+            if len(fa & fb) < CO_OCCUR_FRAC * min(len(fa), len(fb)):
+                keep, drop = (a, b) if len(fa) >= len(fb) else (b, a)
+                yaws = [f["yaw"] for _, f in groups[a] + groups[b]]
+                centres = [c for c in centres if c not in (a, b)] + [circ_median(yaws) % 360.0]
+                groups = assign(centres)
+                merged_any = True
+                break
 
-            for sector_yaw in SECTORS:
-                crop  = fisheye_to_flat(img, sector_yaw)
-                faces = detect_faces_on_flat_crop(crop, lm)
-                for (cx_norm, cy_norm) in faces:
-                    local_yaw   = sector_yaw + math.degrees(math.atan((cx_norm - 0.5) / focal_norm))
-                    local_pitch = -math.degrees(math.atan((cy_norm - 0.5) / focal_norm))
-                    global_yaw  = (yaw_offset + yaw_sign * local_yaw) % 360.0
-                    detections.append({
-                        "local_yaw":  local_yaw,
-                        "global_yaw": global_yaw,
-                        "pitch":      local_pitch,
-                        "frame":      i,
-                    })
+    # keep seats occupied often enough; re-assign after dropping weak ones
+    centres = [c for c in centres if len({i for i, _ in groups[c]}) >= min_frames]
+    groups = assign(centres) if centres else {}
 
-            # Early-exit check: stop once clusters have been stable for several intervals
-            if detections and (i + 1) % EARLY_EXIT_INTERVAL == 0:
-                yaws = np.array([d["local_yaw"] for d in detections]).reshape(-1, 1)
-                db   = DBSCAN(eps=15.0, min_samples=3).fit(yaws)
-                curr = sorted(float(np.mean(yaws[db.labels_ == l]))
-                              for l in set(db.labels_) if l != -1)
-                if (prev_centers is not None
-                        and len(curr) == len(prev_centers)
-                        and len(curr) > 0
-                        and all(abs(a - b) < 5.0 for a, b in zip(curr, prev_centers))):
-                    stable_count += 1
-                    if stable_count >= EARLY_EXIT_STABLE_N:
-                        print(f"  Clusters stable — stopping after {i+1}/{total} frames", flush=True)
-                        break
-                else:
-                    stable_count = 0
-                prev_centers = curr
-
-    print(f"  → {len(detections)} raw detections in {lens_label}", flush=True)
-    return detections
-
-
-def cluster_detections(detections, lens_label, yaw_offset, stream, yaw_sign):
-    """DBSCAN-cluster detections by local_yaw; return position dict."""
-    if not detections:
-        return {}
-
-    local_yaws = np.array([d["local_yaw"] for d in detections], dtype=float).reshape(-1, 1)
-    db     = DBSCAN(eps=15.0, min_samples=3).fit(local_yaws)
-    labels = db.labels_
-
-    clusters = {}
-    for label in set(labels):
-        if label == -1:
+    seats = {}
+    for c in sorted(centres, key=geometry.norm_yaw):
+        g = groups[c]
+        if not g:
             continue
-        mask       = labels == label
-        mean_local = float(np.mean(local_yaws[mask]))
-        mean_pitch = float(np.mean([d["pitch"] for d, m in zip(detections, mask) if m]))
-        count      = int(mask.sum())
-        global_yaw = round((yaw_offset + yaw_sign * mean_local) % 360.0, 1)
-        pitch      = round(max(-45.0, min(45.0, mean_pitch)), 1)
-
-        key = f"{lens_label}_{label}"
-        clusters[key] = {
-            "yaw_degrees":     global_yaw,
-            "pitch_degrees":   pitch,
-            "h_fov":           CROP_H_FOV,
-            "lens":            lens_label,
-            "stream":          stream,
-            "detection_count": count,
-        }
-        print(f"  cluster {key}: yaw={global_yaw}°  pitch={pitch}°  n={count}", flush=True)
-
-    return clusters
-
-
-# ── Equirect (YouTube 360°) path ──────────────────────────────────────────────
-
-def detect_equirect(frames_dir):
-    """For equirectangular frames: detect faces directly (less distortion)."""
-    frame_files = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
-    total = len(frame_files)
-    detections = []
-
-    with _make_landmarker() as lm:
-        for i, fname in enumerate(frame_files):
-            print(f"PROGRESS {i+1}/{total}", flush=True)
-            img = cv2.imread(os.path.join(frames_dir, fname))
-            if img is None:
-                continue
-            import mediapipe as mp
-            H, W = img.shape[:2]
-            rgb    = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = lm.detect(mp_img)
-            for face in result.face_landmarks:
-                xs = [lm2.x for lm2 in face]
-                ys = [lm2.y for lm2 in face]
-                detections.append({
-                    "cx": float(np.mean(xs)) * W,
-                    "cy": float(np.mean(ys)) * H,
-                    "width": W, "height": H,
-                })
-
-    from sklearn.cluster import DBSCAN as _DB
-    if not detections:
-        return {}
-    xs      = np.array([d["cx"] for d in detections])
-    widths  = np.array([d["width"] for d in detections])
-    xs_norm = (xs / widths) * 1000
-    db = _DB(eps=80.0, min_samples=3).fit(xs_norm.reshape(-1, 1))
-    clusters = {}
-    for label in set(db.labels_):
-        if label == -1:
+        yaws = [f["yaw"] for _, f in g]
+        jaws = [f["jaw"] for _, f in g]
+        if np.std(jaws) < STATIC_JAW_STD and np.std([geometry.norm_yaw(y - c) for y in yaws]) < STATIC_YAW_STD:
+            print(f"  yaw {geometry.norm_yaw(c):+.0f}°: static face (poster/screen) — not a seat", flush=True)
             continue
-        mask   = db.labels_ == label
-        mean_x = float(np.mean(xs[mask]))
-        mean_y = float(np.mean([d["cy"] for d, m in zip(detections, mask) if m]))
-        mean_w = float(np.mean(widths[mask]))
-        mean_h = float(np.mean([d["height"] for d in detections]))
-        yaw    = round((mean_x / mean_w) * 360.0 - 180.0, 1)
-        pitch  = round((0.5 - mean_y / mean_h) * 180.0, 1)
-        clusters[f"equirect_{label}"] = {
-            "yaw_degrees": yaw, "pitch_degrees": pitch, "h_fov": 75,
-            "lens": "equirect", "stream": 0, "detection_count": int(mask.sum()),
+        yaw = circ_median(yaws)
+        key = f"seat_{len(seats)}"
+        seats[key] = {
+            "yaw_degrees":     round(yaw, 2),
+            "pitch_degrees":   round(float(np.median([f["pitch"] for _, f in g])), 2),
+            "face_deg":        round(float(np.median([f["size"] for _, f in g])), 2),
+            "lens":            "front" if abs(yaw) <= 90 else "back",
+            "frames_present":  len({i for i, _ in g}),
+            "detection_count": len(g),
+            "geom":            2,
         }
-    return clusters
+    return seats, fg
+
+
+def build_tracks(seats, fg, num_frames):
+    """Per seat, per frame: [yaw, pitch, size, jaw] of that seat's face or None."""
+    tracks = {k: [None] * num_frames for k in seats}
+    best = {}
+    for i, f in fg:
+        near = sorted(seats, key=lambda k: yaw_diff(f["yaw"], seats[k]["yaw_degrees"]))
+        if not near:
+            continue
+        k = near[0]
+        gate = SEAT_GATE_DEG
+        if len(near) > 1:
+            gate = min(gate, 0.6 * yaw_diff(seats[k]["yaw_degrees"], seats[near[1]]["yaw_degrees"]))
+        d = yaw_diff(f["yaw"], seats[k]["yaw_degrees"])
+        if d > gate:
+            continue
+        if (k, i) not in best or d < best[(k, i)]:   # two faces near a seat: keep the closer
+            best[(k, i)] = d
+            tracks[k][i] = [round(f["yaw"], 2), round(f["pitch"], 2),
+                            round(f["size"], 2), round(f["jaw"], 3)]
+    return tracks
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mode         = os.environ.get("VIDEO_MODE", "fisheye")
-    all_clusters = {}
-
-    if mode == "equirect":
-        frames_dir = "frames/equirect"
-        if not os.path.isdir(frames_dir) or not os.listdir(frames_dir):
-            print(f"No frames found in {frames_dir}. Run step 1 first.")
-        else:
-            all_clusters = detect_equirect(frames_dir)
-    else:
-        # yaw_sign: front=+1 (right in scene = +yaw), back=-1 (mirrored since lens faces backward)
-        lens_configs = [("front", 0.0, 0, +1), ("back", 180.0, 1, -1)]
-        # Pre-count frames across all lenses so PROGRESS never resets between lenses
-        def _count_frames(d):
-            try: return len([f for f in os.listdir(d) if f.endswith(".jpg")])
-            except OSError: return 0
-        grand_total  = sum(_count_frames(f"frames/{l}") for l, *_ in lens_configs)
-        prog_offset  = 0
-        for lens, yaw_offset, stream, yaw_sign in lens_configs:
-            frames_dir = f"frames/{lens}"
-            if not os.path.isdir(frames_dir) or not os.listdir(frames_dir):
-                print(f"No frames in {frames_dir}, skipping.")
-                continue
-            dets     = scan_lens(frames_dir, lens, yaw_offset, stream, yaw_sign,
-                                 progress_offset=prog_offset, progress_total=grand_total)
-            prog_offset += _count_frames(frames_dir)
-            clusters = cluster_detections(dets, lens, yaw_offset, stream, yaw_sign)
-            all_clusters.update(clusters)
-
-    if all_clusters:
-        os.makedirs("data", exist_ok=True)
-        out_path = "data/speaker_positions.json"
-        with open(out_path, "w") as f:
-            json.dump(all_clusters, f, indent=2)
-        print(f"\nSpeaker positions saved to {out_path}:")
-        for name, info in sorted(all_clusters.items()):
-            print(f"  {name}: yaw={info['yaw_degrees']}°  pitch={info['pitch_degrees']}°  "
-                  f"stream={info['stream']}  ({info['detection_count']} detections)")
-    else:
-        print("No stable speaker positions found.")
+    files = frame_files()
+    if not files:
+        print("No frames found. Run step 1 first.")
         sys.exit(1)
+    meta = load_frame_meta()
+    interval = float(meta.get("interval", 10))
+    fov = geometry.lens_fov() if geometry.video_mode() == "fisheye" else None
+    N = len(files)
+    print(f"Scanning {N} frames × {len(SECTOR_YAWS)} directions "
+          f"(interval {interval}s, lens fov {fov}, {N_WORKERS} workers)…", flush=True)
+
+    per_frame = [[] for _ in range(N)]
+    done = 0
+    with Pool(N_WORKERS, initializer=_init_worker, initargs=(fov,)) as pool:
+        for idx, faces in pool.imap_unordered(scan_frame, list(enumerate(files)), chunksize=2):
+            per_frame[idx] = faces
+            done += 1
+            print(f"PROGRESS {done}/{N}", flush=True)
+
+    dets = [(i, f) for i, fl in enumerate(per_frame) for f in fl]
+    print(f"  → {len(dets)} face detections", flush=True)
+
+    seats, fg = find_seats(dets, N)
+    if not seats:
+        print("No stable seats found.")
+        sys.exit(1)
+
+    os.makedirs("data", exist_ok=True)
+    with open("data/speaker_positions.json", "w") as f:
+        json.dump(seats, f, indent=2)
+    with open("data/face_tracks.json", "w") as f:
+        json.dump({"interval": interval, "num_frames": N,
+                   "seats": build_tracks(seats, fg, N)}, f)
+
+    print("\nSeats saved to data/speaker_positions.json:")
+    for k, s in seats.items():
+        print(f"  {k}: yaw={s['yaw_degrees']:+.1f}°  pitch={s['pitch_degrees']:+.1f}°  "
+              f"face={s['face_deg']:.1f}°  present {s['frames_present']}/{N} frames", flush=True)

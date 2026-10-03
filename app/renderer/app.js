@@ -405,7 +405,7 @@ async function startPipeline() {
   if (!videoPath) return
 
   const hfToken = $('hf-token').value.trim()
-  if (!hfToken) {
+  if (!hfToken && !bundledRuntime) {
     setStatus('⚠ Enter your Hugging Face token first')
     return
   }
@@ -462,9 +462,21 @@ function setStatus(msg) {
 }
 
 // ── First-time setup ──────────────────────────────────────────────────────────
+let bundledRuntime = false   // self-contained app: models ship inside, no token needed
+
 async function checkSetup() {
   const res = await window.api.checkSetup()
-  if (!res.ready) showSetupOverlay()
+  bundledRuntime = !!res.bundled
+  if (bundledRuntime) $('token-section').classList.add('hidden')
+  if (res.ready) return
+  showSetupOverlay()
+  if (bundledRuntime) {
+    // nothing to install — the app itself is incomplete or on the wrong Mac
+    $('setup-card').querySelector('h2').textContent = 'This copy of 360 AutoCam can\'t run'
+    $('setup-card').querySelector('p').textContent = res.reason
+    $('btn-setup-start').classList.add('hidden')
+    $('setup-progress').classList.add('hidden')
+  }
 }
 
 function showSetupOverlay() {
