@@ -189,9 +189,15 @@ def encode_shot(video_path, views, start, end, out_path):
     _run_ffmpeg([
         "ffmpeg", "-hwaccel", "videotoolbox", "-ss", f"{start:.6f}", "-i", video_path,
         "-t", f"{end - start:.6f}",
-        "-filter_complex", geometry.views_graph(views, layout=LAYOUT[len(views)]),
-        "-map", "[out]", "-an",
-        "-c:v", "hevc_videotoolbox", "-b:v", "8M",
+        # Insta360 footage is full-range (yuvj420p); QuickTime/iOS expect video
+        # range with explicit bt709 tags, and only accept HEVC tagged hvc1.
+        "-filter_complex", geometry.views_graph(views, layout=LAYOUT[len(views)])
+                           + ";[out]scale=in_range=pc:out_range=tv,format=yuv420p,"
+                             "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709[v]",
+        "-map", "[v]", "-an",
+        "-c:v", "hevc_videotoolbox", "-b:v", "8M", "-tag:v", "hvc1",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
         out_path, "-y"
     ])
 
@@ -690,7 +696,7 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
             f.write(f"file '{c}'\n")
     silent_video = os.path.join(segments_dir, "video_only.mp4")
     subprocess.run(["ffmpeg", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat_list,
-                    "-c", "copy", "-an", silent_video, "-y"], check=True)
+                    "-c", "copy", "-tag:v", "hvc1", "-an", silent_video, "-y"], check=True)
 
     # ONE continuous audio track over the whole video (gapless). Output time 0 ==
     # camera time timeline[0].start; video is the master clock (apad + shortest).
@@ -704,8 +710,8 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
         "-ss", f"{t0:.6f}", "-i", audio_src,
         "-map", "0:v:0", "-map", "1:a:0",
         "-af", "apad",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-shortest",
+        "-c:v", "copy", "-tag:v", "hvc1", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart",
         output_path, "-y"
     ], check=True)
     print(f"Done! Output: {output_path}")
