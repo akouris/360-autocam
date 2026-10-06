@@ -112,6 +112,7 @@ function createWebServer(opts) {
     if (!name || !kindOf(name)) return fail(res, 400, 'Only video (.insv .mp4 .mov) or audio (.mp3 .wav .m4a .aac) files')
     const len = parseInt(req.headers['content-length'] || '', 10)
     if (!(len > 0)) return fail(res, 411, 'missing file size')
+    if (busy()) return fail(res, 409, 'Busy: another render is running. Try again when it has finished.')
 
     const dir = path.join(uploadsDir, batch)
     fs.mkdirSync(dir, { recursive: true })
@@ -158,7 +159,11 @@ function createWebServer(opts) {
     try {
       json(res, 200, enqueue({ videoPath: video, audioPath: audio, videoMode: body.videoMode,
                                previewMode: !!body.previewMode, uploadDir }))
-    } catch (e) { fail(res, 409, e.message) }
+    } catch (e) {
+      // refused (busy): an upload made for this job is useless now
+      if (uploadDir) fs.rm(uploadDir, { recursive: true, force: true }, () => {})
+      fail(res, 409, e.message)
+    }
   }
 
   function download(req, res, id) {

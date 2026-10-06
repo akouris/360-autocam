@@ -73,6 +73,12 @@ function loadSettings() {
   try { s = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')) } catch {}
   return { ...DEFAULT_SETTINGS, ...s, web: { ...DEFAULT_SETTINGS.web, ...(s.web || {}) } }
 }
+// The web UI always needs a PIN; one is generated if none is set.
+function ensurePin() {
+  const s = loadSettings()
+  if (s.web.pin) return s
+  return saveSettings({ web: { pin: String(crypto.randomInt(100000, 1000000)) } })
+}
 function saveSettings(patch) {
   const cur = loadSettings()
   const next = { ...cur, ...patch, web: { ...cur.web, ...(patch.web || {}) } }
@@ -357,9 +363,9 @@ ipcMain.handle('job:scan', (_, videoPath) => {
 
 ipcMain.handle('job:clear', (_, videoPath) => clearJobDir(videoPath))
 
-// ── Job queue ─────────────────────────────────────────────────────────────────
-// One queue shared by the desktop window and the LAN web UI. Jobs run one at a
-// time: a single render already saturates the machine.
+// ── Jobs ──────────────────────────────────────────────────────────────────────
+// Shared by the desktop window and the LAN web UI. Exactly one render at a
+// time (see enqueueJob): a render already saturates the machine.
 const jobs = []
 let jobSeq = 0
 let sleepBlock = null
@@ -385,9 +391,15 @@ function publishJobs() {
 function enqueueJob({ videoPath, audioPath, videoMode, previewMode, source, uploadDir }) {
   if (!videoPath || !fs.existsSync(videoPath)) throw new Error(`Video not found: ${videoPath}`)
   if (audioPath && !fs.existsSync(audioPath)) throw new Error(`Audio not found: ${audioPath}`)
-  const active = jobs.find(j => (j.status === 'queued' || j.status === 'running') &&
-                                path.resolve(j.videoPath) === path.resolve(videoPath))
-  if (active) throw new Error(`${path.basename(videoPath)} is already ${active.status}`)
+  // ONE render at a time, no queue: while a job runs, every new request (web
+  // or this window) is refused, so users can't stack renders on the machine
+  const active = jobs.find(j => j.status === 'queued' || j.status === 'running')
+  if (active) {
+    const mins = Math.round((Date.now() - (active.startedAt || active.createdAt)) / 60000)
+    throw new Error(`Busy: already rendering ${path.basename(active.videoPath)}` +
+      ` (started ${mins} min ago from ${active.source === 'web' ? 'the web' : 'the desktop app'}).` +
+      ' Try again when it has finished.')
+  }
   const job = {
     id: `j${++jobSeq}`, videoPath, audioPath: audioPath || null,
     videoMode: videoMode === 'equirect' ? 'equirect' : 'fisheye', previewMode: !!previewMode,
@@ -477,8 +489,11 @@ ipcMain.handle('jobs:cancel', (_, id) => cancelJob(id))
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 function spawnScript(job, script, args, opts, onLine) {
   return new Promise((resolve, reject) => {
-    // own process group, so Stop also reaches the ffmpeg workers a script starts
-    const proc = spawn(PYTHON_BIN, [path.join(SCRIPTS_DIR, script), ...args], { ...opts, detached: true })
+    // own process group, so Stop also reaches the ffmpeg workers a script starts.
+    // nice 10: everything else on the Mac (live streaming, audio) wins the CPU;
+    // the pipeline only uses what is left. ffmpeg children inherit it.
+    const proc = spawn('/usr/bin/nice', ['-n', '10', PYTHON_BIN, path.join(SCRIPTS_DIR, script), ...args],
+                       { ...opts, detached: true })
     job.procs.add(proc)
     const flush = (d) => d.toString().split(/\r?\n|\r/)
       .filter(l => l.trim())
@@ -705,14 +720,14 @@ function webStatus() {
   const s = loadSettings().web
   if (!s.enabled) return { enabled: false }
   if (!web) return { enabled: true, error: webError }
-  return { enabled: true, port: web.port, urls: lanAddresses(web.port), pin: !!s.pin }
+  return { enabled: true, port: web.port, urls: lanAddresses(web.port), pin: s.pin }
 }
 
 let webError = null
 async function startWeb() {
   if (web) { await web.close(); web = null }
   webError = null
-  const s = loadSettings().web
+  const s = ensurePin().web
   if (s.enabled) {
     try {
       web = await createWebServer({

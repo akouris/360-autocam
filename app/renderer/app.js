@@ -389,9 +389,8 @@ $('log-header').addEventListener('click', () => {
 
 // ── Buttons ───────────────────────────────────────────────────────────────────
 function updateRunButton() {
-  $('btn-run').disabled = !videoPath
-  if (running && videoPath) $('btn-run').textContent = '＋ Add to Queue'
-  else if ($('btn-run').textContent === '＋ Add to Queue') $('btn-run').textContent = '▶ Run Pipeline'
+  // one render at a time across the desktop and the web UI
+  $('btn-run').disabled = !videoPath || running
 }
 
 $('preview-mode').addEventListener('change', () => { previewMode = $('preview-mode').checked })
@@ -418,11 +417,11 @@ async function startPipeline() {
   // Save token on run
   window.api.saveSettings({ hfToken })
 
-  // Jobs go through the shared queue (desktop + web); pipeline:started resets
+  // Jobs go through the shared job list (desktop + web, one at a time);
+  // pipeline:started resets
   // the UI when this job actually begins.
   const res = await window.api.runPipeline({ videoPath, audioPath, videoMode, previewMode })
   if (res.error) setStatus(`✕ ${res.error}`)
-  else if (res.ahead) setStatus(`Queued — ${res.ahead} job(s) ahead`)
 }
 
 let currentJob = null
@@ -470,11 +469,6 @@ window.api.onPipelineAborted(() => {
   setStatus('Stopped')
 })
 
-window.api.onJobsUpdate((list) => {
-  const queued = list.filter(j => j.status === 'queued').length
-  $('hw-est').title = queued ? `${queued} job(s) waiting` : ''
-  if (!running && queued) setStatus(`${queued} job(s) queued`)
-})
 
 // ── LAN web access + settings ────────────────────────────────────────────────
 let webState = { enabled: false }
@@ -492,6 +486,7 @@ function showWebStatus(st) {
   const box = $('web-urls')
   box.innerHTML = ''
   if (st.error) box.appendChild(el('div', 'err', `Could not start: ${st.error}`))
+  if (st.pin) box.appendChild(el('div', 'web-pin', `PIN: ${st.pin}`))
   for (const u of st.urls || []) {
     const a = el('a', null, u)
     a.addEventListener('click', () => window.api.openUrl(u))

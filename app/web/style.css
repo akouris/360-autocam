@@ -80,6 +80,7 @@ h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
 .msg { font-size: 13px; margin-top: 10px; min-height: 1em; }
 .msg.err { color: var(--red); }
 .msg.ok { color: var(--green); }
+#busy-note { color: var(--yellow); }
 
 #jobs { list-style: none; display: grid; gap: 10px; }
 .job { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--bg); }

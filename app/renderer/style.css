@@ -555,4 +555,5 @@ html, body {
 #web-urls { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
 #web-urls a { font-family: var(--mono); font-size: 12px; color: var(--accent); cursor: pointer; text-decoration: none; }
 #web-urls .err { font-size: 12px; color: var(--red); }
+#web-urls .web-pin { font-family: var(--mono); font-size: 12px; color: var(--text); margin-top: 4px; }
 #settings-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px; }

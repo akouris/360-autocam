@@ -93,7 +93,10 @@ function updateSelection() {
   $('sel-video').textContent = v || 'none selected'
   $('sel-audio').textContent = a || 'none'
   $('clear-audio').classList.toggle('hidden', !a)
-  $('go').disabled = !v || busyUploading
+  const busyJob = jobs.find(j => j.status === 'running' || j.status === 'queued')
+  $('go').disabled = !v || busyUploading || !!busyJob
+  $('busy-note').textContent = busyJob && !busyUploading
+    ? `A render is running (${busyJob.name}). Only one render at a time — you can start yours when it finishes.` : ''
   $('go').textContent = tab === 'upload' ? 'Upload & render' : 'Render'
 }
 
@@ -198,12 +201,13 @@ $('go').addEventListener('click', async () => {
     if (tab === 'browse') {
       if (!picked.video) return
       const r = await api('POST', '/api/jobs', { ...opts, videoPath: picked.video.path, audioPath: picked.audio?.path })
-      msg(r.ahead ? `Queued — ${r.ahead} job(s) ahead` : 'Started', 'ok')
+      msg('Started', 'ok')
       return
     }
     const fv = $('up-video').files[0], fa = $('up-audio').files[0]
     if (!fv) return
     info = await api('GET', '/api/info')
+    if (info.busy) throw new Error('Another render is running. Only one at a time — upload when it has finished.')
     const need = fv.size + (fa?.size || 0) + (info.uploadHeadroom || 0)
     if (info.uploadFree != null && info.uploadFree < need) {
       throw new Error(`Not enough space on the render Mac (needs ${fmtSize(need)}, ${fmtSize(info.uploadFree)} free)`)
@@ -216,7 +220,7 @@ $('go').addEventListener('click', async () => {
     const a = fa ? await uploadFile(fa, batch, 'Mic audio') : null
     $('up-label').textContent = 'Upload complete'
     const r = await api('POST', '/api/jobs', { ...opts, videoPath: v.path, audioPath: a?.path })
-    msg(r.ahead ? `Uploaded — queued with ${r.ahead} job(s) ahead` : 'Uploaded — render started', 'ok')
+    msg('Uploaded — render started', 'ok')
     $('up-video').value = ''
     $('up-audio').value = ''
   } catch (e) {
@@ -234,6 +238,7 @@ function renderJobs() {
   const running = jobs.find(j => j.status === 'running')
   $('busy').textContent = running ? `Rendering: ${running.name}` : 'Idle'
   $('busy').classList.toggle('on', !!running)
+  updateSelection()
   if (!jobs.length) { ul.appendChild(h('li', 'empty', 'No jobs yet')); return }
 
   for (const j of [...jobs].reverse()) {

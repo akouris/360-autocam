@@ -126,10 +126,11 @@
     <div id="web-urls"></div>
     <div class="set-grid">
       <label>Port <input type="number" id="set-web-port" min="1024" max="65535"></label>
-      <label>Access PIN <input type="text" id="set-web-pin" placeholder="none — anyone on the LAN" autocomplete="off" spellcheck="false"></label>
+      <label>Access PIN <input type="text" id="set-web-pin" placeholder="leave empty for a new random PIN" autocomplete="off" spellcheck="false"></label>
     </div>
     <div class="set-hint">Web users can browse your home folder and mounted network drives (/Volumes), upload files,
-      and queue renders. Jobs run one at a time, shared with this window. Closing this window keeps the web UI running; quit with ⌘Q.</div>
+      and start renders. Only one render runs at a time (from the web or this window); others are refused until it
+      finishes. Renders run at low priority, so other work on this Mac comes first. Closing this window keeps the web UI running; quit with ⌘Q.</div>
 
     <div class="set-section">After a successful render</div>
     <label class="set-row"><input type="checkbox" id="set-keep-work"> Keep working files (frames, audio, analysis) for debugging</label>
