@@ -1,9 +1,11 @@
 'use strict'
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, shell, powerSaveBlocker } = require('electron')
 const { execSync, spawn } = require('child_process')
 const path = require('path')
 const fs   = require('fs')
 const os   = require('os')
+const crypto = require('crypto')
+const { createWebServer } = require('./webserver')
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const IS_PKG     = app.isPackaged
@@ -52,10 +54,37 @@ function refreshVenvPaths(dir) {
   PIP_BIN    = path.join(dir, 'bin', 'pip')
 }
 
+// Working files live on the local disk (never next to the source video, which
+// may sit on a slow or read-only network share) and are deleted after a
+// successful run. Only the finished video lands next to the source.
+const WORK_ROOT   = path.join(app.getPath('cache'), '360 AutoCam', 'jobs')
+const OUTPUTS_DIR = path.join(app.getPath('videos'), '360 AutoCam')    // fallback when the source folder is read-only
+const UPLOADS_DIR = path.join(OUTPUTS_DIR, 'Uploads')                   // web uploads (deleted after a successful run)
+const STALE_DAYS  = 7
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+const DEFAULT_SETTINGS = {
+  hfToken: '',
+  keepWorkFiles: false,
+  web: { enabled: true, port: 8360, pin: '' },
+}
+function loadSettings() {
+  let s = {}
+  try { s = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')) } catch {}
+  return { ...DEFAULT_SETTINGS, ...s, web: { ...DEFAULT_SETTINGS.web, ...(s.web || {}) } }
+}
+function saveSettings(patch) {
+  const cur = loadSettings()
+  const next = { ...cur, ...patch, web: { ...cur.web, ...(patch.web || {}) } }
+  fs.mkdirSync(APP_DATA, { recursive: true })
+  fs.writeFileSync(SETTINGS, JSON.stringify(next, null, 2))
+  return next
+}
+
 // ── Window ────────────────────────────────────────────────────────────────────
 let win
 
-app.whenReady().then(() => {
+function createWindow() {
   const iconPath = path.join(IS_PKG ? process.resourcesPath : __dirname, 'resources', 'icon.icns')
   win = new BrowserWindow({
     width: 980, height: 740,
@@ -70,9 +99,27 @@ app.whenReady().then(() => {
       nodeIntegration: false,
     },
   })
+  win.on('closed', () => { win = null })
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'))
+}
+
+app.whenReady().then(() => {
+  pruneStale()
+  createWindow()
+  startWeb()
 })
-app.on('window-all-closed', () => app.quit())
+app.on('activate', () => { if (!win) createWindow() })
+// While the web UI is serving the LAN, closing the window keeps the app (and
+// any running job) alive; it quits from the Dock / ⌘Q as usual.
+app.on('window-all-closed', () => { if (!web) app.quit() })
+app.on('before-quit', () => {
+  for (const j of jobs) if (j.status === 'running') abortJob(j)
+})
+
+// Push an event to the desktop window (if open) and every web client.
+function toWindow(ch, data) {
+  if (win && !win.isDestroyed()) win.webContents.send(ch, data)
+}
 
 // ── Hardware info ─────────────────────────────────────────────────────────────
 ipcMain.handle('hardware:info', () => {
@@ -89,35 +136,6 @@ ipcMain.handle('hardware:info', () => {
     ? `~${ramGB >= 32 ? 30 : ramGB >= 16 ? 40 : 50} min / 30-min video`
     : '~60+ min / 30-min video (Intel)'
   return { cpu, cores, ramGB, isARM, hasVideoToolbox: true, perfEst }
-})
-
-// ── Settings ──────────────────────────────────────────────────────────────────
-ipcMain.handle('settings:load', () => {
-  try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')) } catch { return {} }
-})
-ipcMain.handle('settings:save', (_, s) => {
-  fs.mkdirSync(APP_DATA, { recursive: true })
-  fs.writeFileSync(SETTINGS, JSON.stringify(s, null, 2))
-  return true
-})
-
-// ── File dialogs ──────────────────────────────────────────────────────────────
-ipcMain.handle('dialog:video', async () => {
-  const r = await dialog.showOpenDialog(win, {
-    title: 'Select 360° Video',
-    filters: [{ name: 'Video Files', extensions: ['insv', 'mp4', 'mov'] }],
-    properties: ['openFile'],
-  })
-  return r.canceled ? null : r.filePaths[0]
-})
-
-ipcMain.handle('dialog:audio', async () => {
-  const r = await dialog.showOpenDialog(win, {
-    title: 'Select External Mic Recording (optional)',
-    filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a', 'aac'] }],
-    properties: ['openFile'],
-  })
-  return r.canceled ? null : r.filePaths[0]
 })
 
 // ── First-time setup ──────────────────────────────────────────────────────────
@@ -224,25 +242,43 @@ ipcMain.handle('setup:install', (event) => new Promise((resolve) => {
   })
 }))
 
-// ── Pipeline ──────────────────────────────────────────────────────────────────
-const currentProcesses = new Set()  // all live child processes (parallel steps possible)
-let pipelineAborted = false
+ipcMain.handle('settings:load', () => loadSettings())
+ipcMain.handle('settings:save', (_, patch) => {
+  const before = loadSettings().web
+  const s = saveSettings(patch)
+  if (JSON.stringify(before) !== JSON.stringify(s.web)) startWeb()
+  return s
+})
 
-ipcMain.on('pipeline:stop', () => {
-  pipelineAborted = true
-  for (const proc of currentProcesses) {
-    try { proc.kill('SIGTERM') } catch (_) {}
-  }
-  currentProcesses.clear()
-  if (win) win.webContents.send('pipeline:aborted')
+// ── File dialogs ──────────────────────────────────────────────────────────────
+ipcMain.handle('dialog:video', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Select 360° Video',
+    filters: [{ name: 'Video Files', extensions: ['insv', 'mp4', 'mov'] }],
+    properties: ['openFile'],
+  })
+  return r.canceled ? null : r.filePaths[0]
+})
+
+ipcMain.handle('dialog:audio', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Select External Mic Recording (optional)',
+    filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a', 'aac'] }],
+    properties: ['openFile'],
+  })
+  return r.canceled ? null : r.filePaths[0]
 })
 
 ipcMain.on('shell:open', (_, p) => shell.showItemInFolder(p))
+ipcMain.on('shell:url',  (_, u) => { if (/^https?:\/\//.test(u)) shell.openExternal(u) })
 
-// ── Job scanning (resume support) ─────────────────────────────────────────────
+// ── Job directories ───────────────────────────────────────────────────────────
+// One work dir per source file (keyed by its absolute path), so an interrupted
+// job resumes where it stopped.
 function jobDirFor(videoPath) {
   const base = path.basename(videoPath, path.extname(videoPath))
-  return path.join(path.dirname(videoPath), `autocam_${base}`)
+  const key  = crypto.createHash('sha1').update(path.resolve(videoPath)).digest('hex').slice(0, 8)
+  return path.join(WORK_ROOT, `${base}_${key}`)
 }
 
 function hasFrames(jobDir) {
@@ -268,59 +304,215 @@ function completedSteps(jobDir) {
   }
 }
 
+function clearJobDir(videoPath) {
+  const jobDir = jobDirFor(videoPath)
+  if (fs.existsSync(jobDir)) fs.rmSync(jobDir, { recursive: true, force: true })
+}
+
+// Work dirs and uploads untouched for a week belong to abandoned jobs.
+function pruneStale() {
+  const cutoff = Date.now() - STALE_DAYS * 86400e3
+  for (const root of [WORK_ROOT, UPLOADS_DIR]) {
+    let names = []
+    try { names = fs.readdirSync(root) } catch { continue }
+    for (const n of names) {
+      const p = path.join(root, n)
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { recursive: true, force: true }) } catch {}
+    }
+  }
+}
+
+function isWritableDir(dir) {
+  try { fs.accessSync(dir, fs.constants.W_OK); return true } catch { return false }
+}
+
+// Where the finished video goes: next to the source if that folder is writable
+// (uploads always go to OUTPUTS_DIR). Full renders never overwrite an existing
+// file; previews replace the previous preview.
+function finalOutputPath(job) {
+  const base = path.basename(job.videoPath, path.extname(job.videoPath))
+  const srcDir = path.dirname(job.videoPath)
+  const dir = !job.uploadDir && isWritableDir(srcDir) ? srcDir : OUTPUTS_DIR
+  fs.mkdirSync(dir, { recursive: true })
+  const stem = `${base}_autocam${job.previewMode ? '_preview' : ''}`
+  let out = path.join(dir, `${stem}.mp4`)
+  for (let n = 2; !job.previewMode && fs.existsSync(out); n++) out = path.join(dir, `${stem} (${n}).mp4`)
+  return out
+}
+
+async function moveFile(src, dst) {
+  try { await fs.promises.rename(src, dst) }
+  catch (e) {
+    if (e.code !== 'EXDEV') throw e
+    await fs.promises.copyFile(src, dst)   // different volume (e.g. network share)
+    await fs.promises.unlink(src)
+  }
+}
+
 ipcMain.handle('job:scan', (_, videoPath) => {
   const jobDir = jobDirFor(videoPath)
   if (!fs.existsSync(jobDir)) return { jobDir: null, completed: {} }
   return { jobDir, completed: completedSteps(jobDir) }
 })
 
-ipcMain.handle('job:clear', (_, videoPath) => {
-  const jobDir = jobDirFor(videoPath)
-  if (!fs.existsSync(jobDir)) return
-  for (const sub of ['data', 'output']) {
-    const d = path.join(jobDir, sub)
-    if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true })
-    fs.mkdirSync(d, { recursive: true })
+ipcMain.handle('job:clear', (_, videoPath) => clearJobDir(videoPath))
+
+// ── Job queue ─────────────────────────────────────────────────────────────────
+// One queue shared by the desktop window and the LAN web UI. Jobs run one at a
+// time: a single render already saturates the machine.
+const jobs = []
+let jobSeq = 0
+let sleepBlock = null
+const LOG_TAIL = 300
+
+function publicJob(j) {
+  return {
+    id: j.id, name: path.basename(j.videoPath), audioName: j.audioPath ? path.basename(j.audioPath) : null,
+    source: j.source, status: j.status, previewMode: j.previewMode, videoMode: j.videoMode,
+    steps: j.steps, stepStates: j.stepStates, error: j.error,
+    outputName: j.outputPath ? path.basename(j.outputPath) : null,
+    outputPath: j.source === 'desktop' ? j.outputPath : undefined,
+    createdAt: j.createdAt, startedAt: j.startedAt, finishedAt: j.finishedAt,
   }
-  // Recreate frames dir with per-lens subdirs so detect step never skips silently
-  const framesDir = path.join(jobDir, 'frames')
-  if (fs.existsSync(framesDir)) fs.rmSync(framesDir, { recursive: true, force: true })
-  for (const sub of ['front', 'back', 'equirect']) {
-    fs.mkdirSync(path.join(framesDir, sub), { recursive: true })
+}
+
+function publishJobs() {
+  const list = jobs.map(publicJob)
+  toWindow('jobs:update', list)
+  if (web) web.publish('jobs', list)
+}
+
+function enqueueJob({ videoPath, audioPath, videoMode, previewMode, source, uploadDir }) {
+  if (!videoPath || !fs.existsSync(videoPath)) throw new Error(`Video not found: ${videoPath}`)
+  if (audioPath && !fs.existsSync(audioPath)) throw new Error(`Audio not found: ${audioPath}`)
+  const active = jobs.find(j => (j.status === 'queued' || j.status === 'running') &&
+                                path.resolve(j.videoPath) === path.resolve(videoPath))
+  if (active) throw new Error(`${path.basename(videoPath)} is already ${active.status}`)
+  const job = {
+    id: `j${++jobSeq}`, videoPath, audioPath: audioPath || null,
+    videoMode: videoMode === 'equirect' ? 'equirect' : 'fisheye', previewMode: !!previewMode,
+    source: source || 'desktop', uploadDir: uploadDir || null,
+    status: 'queued', steps: [], stepStates: {}, log: [], error: null, outputPath: null,
+    createdAt: Date.now(), startedAt: null, finishedAt: null, aborted: false, procs: new Set(),
   }
+  jobs.push(job)
+  // keep the finished history short
+  const finished = jobs.filter(j => !['queued', 'running'].includes(j.status))
+  for (const j of finished.slice(0, Math.max(0, finished.length - 30))) jobs.splice(jobs.indexOf(j), 1)
+  publishJobs()
+  setImmediate(pump)
+  return { jobId: job.id, ahead: jobs.filter(j => j !== job && (j.status === 'queued' || j.status === 'running')).length }
+}
+
+function abortJob(job) {
+  job.aborted = true
+  for (const proc of job.procs) {
+    try { process.kill(-proc.pid, 'SIGTERM') } catch (_) { try { proc.kill('SIGTERM') } catch (_) {} }
+  }
+  job.procs.clear()
+}
+
+function cancelJob(id) {
+  const job = jobs.find(j => j.id === id)
+  if (!job) return false
+  if (job.status === 'queued') {
+    job.status = 'stopped'
+    job.finishedAt = Date.now()
+    publishJobs()
+    return true
+  }
+  if (job.status === 'running') { abortJob(job); return true }
+  return false
+}
+
+async function pump() {
+  if (jobs.some(j => j.status === 'running')) return
+  const job = jobs.find(j => j.status === 'queued')
+  if (!job) {
+    if (sleepBlock !== null) { powerSaveBlocker.stop(sleepBlock); sleepBlock = null }
+    return
+  }
+  // a render takes ~30+ min: keep the Mac from sleeping mid-job
+  if (sleepBlock === null) sleepBlock = powerSaveBlocker.start('prevent-app-suspension')
+  job.status = 'running'
+  job.startedAt = Date.now()
+  publishJobs()
+  toWindow('pipeline:started', publicJob(job))
+  try {
+    await runJob(job)
+    if (job.aborted) {
+      job.status = 'stopped'
+      toWindow('pipeline:aborted', { jobId: job.id })
+    } else {
+      job.status = 'done'
+      toWindow('pipeline:done', { jobId: job.id, outputPath: job.outputPath })
+    }
+  } catch (err) {
+    if (job.aborted) {
+      job.status = 'stopped'
+      toWindow('pipeline:aborted', { jobId: job.id })
+    } else {
+      job.status = 'error'
+      job.error = err.message
+      toWindow('pipeline:error', err.message)
+    }
+  }
+  for (const st of Object.values(job.stepStates)) if (st.status === 'running') st.status = 'stopped'
+  job.finishedAt = Date.now()
+  publishJobs()
+  pump()
+}
+
+ipcMain.handle('pipeline:run', (_, args) => {
+  try { return enqueueJob({ ...args, source: 'desktop' }) }
+  catch (e) { return { error: e.message } }
 })
+ipcMain.on('pipeline:stop', () => {
+  const job = jobs.find(j => j.status === 'running')
+  if (job) abortJob(job)
+})
+ipcMain.handle('jobs:list', () => jobs.map(publicJob))
+ipcMain.handle('jobs:cancel', (_, id) => cancelJob(id))
 
-ipcMain.handle('pipeline:run',  (event, args) => runPipeline(event, args))
-
-function spawnScript(script, args, opts, onLine) {
+// ── Pipeline ──────────────────────────────────────────────────────────────────
+function spawnScript(job, script, args, opts, onLine) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(PYTHON_BIN, [path.join(SCRIPTS_DIR, script), ...args], opts)
-    currentProcesses.add(proc)
+    // own process group, so Stop also reaches the ffmpeg workers a script starts
+    const proc = spawn(PYTHON_BIN, [path.join(SCRIPTS_DIR, script), ...args], { ...opts, detached: true })
+    job.procs.add(proc)
     const flush = (d) => d.toString().split(/\r?\n|\r/)
       .filter(l => l.trim())
       .forEach(l => onLine(l.trim()))
     proc.stdout.on('data', flush)
     proc.stderr.on('data', flush)
     proc.on('close', (code) => {
-      currentProcesses.delete(proc)
-      if (pipelineAborted || code === 0) resolve()
+      job.procs.delete(proc)
+      if (job.aborted || code === 0) resolve()
       else reject(new Error(`${script} exited with code ${code}`))
     })
-    proc.on('error', (err) => { currentProcesses.delete(proc); reject(err) })
+    proc.on('error', (err) => { job.procs.delete(proc); reject(err) })
   })
 }
 
-async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, previewMode }) {
-  const send = (ch, d) => event.sender.send(ch, d)
-  pipelineAborted = false
+async function runJob(job) {
+  const { videoPath, audioPath, videoMode, previewMode } = job
+  const log = (line) => {
+    job.log.push(line)
+    if (job.log.length > LOG_TAIL) job.log.shift()
+    toWindow('pipeline:log', line)
+    if (web) web.publish('log', { jobId: job.id, line })
+  }
+  const setStep = (id, status, pct) => {
+    job.stepStates[id] = { status, pct: pct ?? job.stepStates[id]?.pct ?? 0 }
+    toWindow('pipeline:step', { id, status, pct })
+    if (web) web.publish('step', { jobId: job.id, id, status, pct })
+  }
 
-  // Create job directory alongside the video
-  const ext  = path.extname(videoPath)
-  const base = path.basename(videoPath, ext)
-  const jobDir = path.join(path.dirname(videoPath), `autocam_${base}`)
+  const jobDir = jobDirFor(videoPath)
   for (const d of ['data', 'frames', 'output']) {
     fs.mkdirSync(path.join(jobDir, d), { recursive: true })
   }
+  log(`Working folder: ${jobDir}`)
 
   const venvBin = path.join(VENV_DIR, 'bin')
   // Resolve face_landmarker model: bundle, userData/models, then project data/
@@ -334,7 +526,7 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
   const { HF_TOKEN: _hft, ...inheritedEnv } = process.env
   const env = {
     ...inheritedEnv,
-    HF_TOKEN:              hfToken   || '',
+    HF_TOKEN:              loadSettings().hfToken || '',
     VIDEO_MODE:            videoMode || 'fisheye',
     FACE_LANDMARKER_MODEL: modelPath,
     PYTHONWARNINGS:        'ignore',
@@ -351,6 +543,7 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
   const opts = { cwd: jobDir, env }
 
   const hasAudio = !!(audioPath)
+  const renderOut = previewMode ? 'output/preview.mp4' : 'output/final.mp4'
   // AUDIO-FIRST ORDER: extract camera audio and sync the external mic before any
   // frame work, so an audio problem fails in seconds instead of after minutes of
   // frame extraction + face detection.
@@ -375,14 +568,16 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
     { id: 'render',    label: previewMode ? 'Render (60s preview)' : 'Render',
       script: '4_render.py',
       args: [
-        ...(previewMode ? [videoPath, 'output/preview.mp4', '--end-time', '60'] : [videoPath]),
+        videoPath, renderOut, ...(previewMode ? ['--end-time', '60'] : []),
         // Overlay the synced studio mic as the final audio track (better sound).
         ...(hasAudio ? ['--external-audio', 'data/external_audio_aligned.wav'] : []),
       ] },
   ].filter(Boolean)
 
-  const allStepDefs = steps.map(s => ({ id: s.id, label: s.label }))
-  send('pipeline:steps', allStepDefs)
+  job.steps = steps.map(s => ({ id: s.id, label: s.label }))
+  for (const s of steps) job.stepStates[s.id] = { status: 'pending', pct: 0 }
+  toWindow('pipeline:steps', job.steps)
+  publishJobs()
 
   const done = completedSteps(jobDir)
   if (previewMode) done.render  = false  // always re-render in preview mode
@@ -403,83 +598,140 @@ async function runPipeline(event, { videoPath, audioPath, hfToken, videoMode, pr
 
   // ── Step runner ──────────────────────────────────────────────────────────────
   async function runStep(step) {
-    if (pipelineAborted) return
+    if (!step || job.aborted) return
     if (done[step.id]) {
-      send('pipeline:log', `Skipping ${step.id} — output already exists`)
-      send('pipeline:step', { id: step.id, status: 'done', pct: 100 })
+      log(`Skipping ${step.id} — output already exists`)
+      setStep(step.id, 'done', 100)
       return
     }
-    send('pipeline:step', { id: step.id, status: 'running', pct: 0 })
-    try { await spawnScript(step.script, step.args, opts, (line) => {
+    setStep(step.id, 'running', 0)
+    try { await spawnScript(job, step.script, step.args, opts, (line) => {
       if (/^[WIE]\d{4}\s/.test(line)) return  // MediaPipe C++ noise
 
       const progM = line.match(/^PROGRESS\s+(\d+)\/(\d+)/)
       if (progM) {
-        send('pipeline:step', { id: step.id, status: 'running',
-          pct: Math.round(parseInt(progM[1]) / parseInt(progM[2]) * 100) })
+        setStep(step.id, 'running', Math.round(parseInt(progM[1]) / parseInt(progM[2]) * 100))
         return
       }
       const tqdmM = line.match(/^\s*(\d{1,3})%\|/)
       if (tqdmM) {
-        send('pipeline:step', { id: step.id, status: 'running', pct: parseInt(tqdmM[1]) })
+        setStep(step.id, 'running', parseInt(tqdmM[1]))
         return
       }
       if (step.id === 'render') {
         const segM = line.match(/^\[(\d+)\/(\d+)\]/)
         if (segM) {
-          send('pipeline:step', { id: step.id, status: 'running',
-            pct: Math.round(parseInt(segM[1]) / parseInt(segM[2]) * 100) })
+          setStep(step.id, 'running', Math.round(parseInt(segM[1]) / parseInt(segM[2]) * 100))
           return
         }
       }
-      send('pipeline:log', line)
+      log(line)
     }) } catch (err) {
-      send('pipeline:step', { id: step.id, status: 'error' })
+      setStep(step.id, 'error')
       throw err
     }
-    if (pipelineAborted) return  // killed steps must not be marked done
-    send('pipeline:step', { id: step.id, status: 'done', pct: 100 })
+    if (job.aborted) return  // killed steps must not be marked done
+    setStep(step.id, 'done', 100)
   }
 
   // ── Execution ────────────────────────────────────────────────────────────────
   // Steps are organised into phases; detect + diarize run in parallel after extract.
   const stepMap = Object.fromEntries(steps.map(s => [s.id, s]))
 
-  try {
-    // Phase 0 — camera audio first: an audio problem fails in seconds
-    await runStep(stepMap['audio'])
+  // Phase 0 — camera audio first: an audio problem fails in seconds
+  await runStep(stepMap['audio'])
 
-    // Phase 1 — extract frames (serial prerequisite for everything visual)
-    await runStep(stepMap['extract'])
+  // Phase 1 — extract frames (serial prerequisite for everything visual)
+  await runStep(stepMap['extract'])
 
-    // Phase 2 — detect → presence, in parallel with (optional sync then) diarize
-    if (!pipelineAborted) {
-      const detectChain  = async () => {
-        await runStep(stepMap['detect'])
-        await runStep(stepMap['presence'])
-      }
-      const diarizeChain = async () => {
-        if (stepMap['sync']) await runStep(stepMap['sync'])
-        await runStep(stepMap['diarize'])
-      }
-      const results = await Promise.allSettled([detectChain(), diarizeChain()])
-      // Surface ALL failures (both detect and diarize can fail simultaneously)
-      const failed = results.filter(r => r.status === 'rejected')
-      if (failed.length) throw new Error(failed.map(r => r.reason?.message ?? String(r.reason)).join(' | '))
+  // Phase 2 — detect → presence, in parallel with (optional sync then) diarize
+  if (!job.aborted) {
+    const detectChain  = async () => {
+      await runStep(stepMap['detect'])
+      await runStep(stepMap['presence'])
     }
-
-    // Phase 3 — automap then render (serial)
-    await runStep(stepMap['automap'])
-    await runStep(stepMap['render'])
-  } catch (err) {
-    if (!pipelineAborted) {
-      send('pipeline:error', err.message)
+    const diarizeChain = async () => {
+      await runStep(stepMap['sync'])
+      await runStep(stepMap['diarize'])
     }
-    return
+    const results = await Promise.allSettled([detectChain(), diarizeChain()])
+    // Surface ALL failures (both detect and diarize can fail simultaneously)
+    const failed = results.filter(r => r.status === 'rejected')
+    if (failed.length) throw new Error(failed.map(r => r.reason?.message ?? String(r.reason)).join(' | '))
   }
 
-  if (!pipelineAborted) {
-    const out = path.join(jobDir, 'output', previewMode ? 'preview.mp4' : 'final.mp4')
-    send('pipeline:done', { outputPath: fs.existsSync(out) ? out : jobDir })
+  // Phase 3 — automap then render (serial)
+  await runStep(stepMap['automap'])
+  await runStep(stepMap['render'])
+  if (job.aborted) return
+
+  // ── Deliver + clean up ───────────────────────────────────────────────────────
+  const rendered = path.join(jobDir, renderOut)
+  if (!fs.existsSync(rendered)) throw new Error(`render finished but ${renderOut} is missing`)
+  job.outputPath = finalOutputPath(job)
+  await moveFile(rendered, job.outputPath)
+  log(`Saved ${job.outputPath}`)
+
+  if (previewMode) {
+    // the analysis is reused by the full run, so a preview keeps its work folder
+    log('Preview: working files kept so the full render can reuse the analysis')
+  } else if (loadSettings().keepWorkFiles) {
+    log(`Working files kept (setting): ${jobDir}`)
+  } else {
+    await fs.promises.rm(jobDir, { recursive: true, force: true })
+    if (job.uploadDir) await fs.promises.rm(job.uploadDir, { recursive: true, force: true })
+    log('Working files removed')
   }
 }
+
+// ── LAN web UI ────────────────────────────────────────────────────────────────
+let web = null
+
+function lanAddresses(port) {
+  const urls = []
+  try {
+    const host = execSync('scutil --get LocalHostName', { stdio: 'pipe' }).toString().trim()
+    if (host) urls.push(`http://${host}.local:${port}`)
+  } catch {}
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family === 'IPv4' && !a.internal) urls.push(`http://${a.address}:${port}`)
+    }
+  }
+  return urls
+}
+
+function webStatus() {
+  const s = loadSettings().web
+  if (!s.enabled) return { enabled: false }
+  if (!web) return { enabled: true, error: webError }
+  return { enabled: true, port: web.port, urls: lanAddresses(web.port), pin: !!s.pin }
+}
+
+let webError = null
+async function startWeb() {
+  if (web) { await web.close(); web = null }
+  webError = null
+  const s = loadSettings().web
+  if (s.enabled) {
+    try {
+      web = await createWebServer({
+        port: s.port, pin: s.pin,
+        roots: [os.homedir(), '/Volumes'],
+        uploadsDir: UPLOADS_DIR,
+        listJobs: () => jobs.map(j => ({ ...publicJob(j), log: j.status === 'running' ? j.log : undefined })),
+        enqueue: (args) => enqueueJob({ ...args, source: 'web' }),
+        cancel: cancelJob,
+        outputOf: (id) => {
+          const j = jobs.find(x => x.id === id)
+          return j && j.status === 'done' && j.outputPath && fs.existsSync(j.outputPath) ? j.outputPath : null
+        },
+        busy: () => jobs.some(j => j.status === 'running'),
+      })
+    } catch (e) {
+      webError = e.code === 'EADDRINUSE' ? `port ${s.port} is already in use` : e.message
+    }
+  }
+  toWindow('web:status', webStatus())
+}
+ipcMain.handle('web:status', () => webStatus())

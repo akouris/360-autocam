@@ -14,9 +14,11 @@ let pendingStates    = null   // step states waiting for resume decision
 
 // Step definitions (ordered) — matches main.js dynamically, but we pre-populate
 const STEP_DEFS = [
+  { id: 'audio',    label: 'Extract Audio',    est: '~30 sec' },
+  { id: 'sync',     label: 'Sync Audio',        est: '~2 min', optional: true },
   { id: 'extract',  label: 'Extract Frames',   est: '~1 min'  },
   { id: 'detect',   label: 'Detect Speakers',  est: '~30 sec' },
-  { id: 'sync',     label: 'Sync Audio',        est: '~2 min', optional: true },
+  { id: 'presence', label: 'Detect Presence',  est: '~1 min'  },
   { id: 'diarize',  label: 'Diarize',           est: '~12 min' },
   { id: 'automap',  label: 'Map Speakers',      est: '~5 min'  },
   { id: 'render',   label: 'Render',            est: '~20 min' },
@@ -34,7 +36,6 @@ const el = (tag, cls, text) => {
 // ── Mode toggle ───────────────────────────────────────────────────────────────
 document.querySelectorAll('.mode-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    if (running) return
     videoMode = btn.dataset.mode
     document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'))
     btn.classList.add('active')
@@ -69,7 +70,6 @@ function setupDropZone(dzId, type) {
   const dz = $(dzId)
 
   dz.addEventListener('click', async () => {
-    if (running) return
     const p = type === 'video'
       ? await window.api.selectVideo()
       : await window.api.selectAudio()
@@ -117,8 +117,9 @@ async function setFile(type, p) {
   updateRunButton()
   if (type === 'audio') renderSteps(lastStepStates)
 
-  // Scan for existing job directory when video is selected
-  if (type === 'video') {
+  // Scan for existing job directory when video is selected (not while a job is
+  // running: the step list is showing that job's progress)
+  if (type === 'video' && !running) {
     lastStepStates = {}
     renderSteps({})
     const scan = await window.api.scanJob(p)
@@ -206,9 +207,11 @@ function applyResumeLabel(states) {
 function clearFile(type) {
   if (type === 'video') {
     videoPath = null
-    lastStepStates = {}
-    renderSteps({})
-    $('btn-run').textContent = '▶ Run Pipeline'
+    if (!running) {
+      lastStepStates = {}
+      renderSteps({})
+      $('btn-run').textContent = '▶ Run Pipeline'
+    }
     const dz = $('dz-video')
     dz.classList.remove('filled')
     dz.innerHTML = '<span class="dz-icon">📹</span><span class="dz-hint" id="dz-video-hint">Click or drop .insv / .mp4</span>'
@@ -386,7 +389,9 @@ $('log-header').addEventListener('click', () => {
 
 // ── Buttons ───────────────────────────────────────────────────────────────────
 function updateRunButton() {
-  $('btn-run').disabled = !videoPath || running
+  $('btn-run').disabled = !videoPath
+  if (running && videoPath) $('btn-run').textContent = '＋ Add to Queue'
+  else if ($('btn-run').textContent === '＋ Add to Queue') $('btn-run').textContent = '▶ Run Pipeline'
 }
 
 $('preview-mode').addEventListener('change', () => { previewMode = $('preview-mode').checked })
@@ -413,9 +418,19 @@ async function startPipeline() {
   // Save token on run
   window.api.saveSettings({ hfToken })
 
+  // Jobs go through the shared queue (desktop + web); pipeline:started resets
+  // the UI when this job actually begins.
+  const res = await window.api.runPipeline({ videoPath, audioPath, videoMode, previewMode })
+  if (res.error) setStatus(`✕ ${res.error}`)
+  else if (res.ahead) setStatus(`Queued — ${res.ahead} job(s) ahead`)
+}
+
+let currentJob = null
+
+window.api.onPipelineStarted((job) => {
+  currentJob = job
   running = true
   outputPath = null
-  $('btn-run').disabled  = true
   $('btn-stop').disabled = false
   $('btn-open').classList.remove('visible')
   $('log-scroll').innerHTML = ''
@@ -423,38 +438,90 @@ async function startPipeline() {
   Object.keys(stepStartTimes).forEach(k => delete stepStartTimes[k])
   stopElapsedTicker()
   renderSteps({})
-  setStatus('Running…')
+  setStatus(`Running ${job.name}${job.source === 'web' ? ' (web)' : ''}…`)
+  updateRunButton()
 
   // Auto-expand log
   if (!logExpanded) $('log-header').click()
+})
 
-  const result = await window.api.runPipeline({ videoPath, audioPath, hfToken, videoMode, previewMode })
-  // pipeline:done / pipeline:error / pipeline:aborted events handle completion
+function jobFinished() {
+  running = false
+  $('btn-stop').disabled = true
+  updateRunButton()
 }
 
 window.api.onPipelineDone(({ outputPath: out }) => {
-  running    = false
+  jobFinished()
   outputPath = out
-  $('btn-run').disabled  = false
-  $('btn-stop').disabled = true
-  $('btn-run').textContent = '↺ Re-run Pipeline'
+  if (currentJob?.source !== 'web') $('btn-run').textContent = '↺ Re-run Pipeline'
   $('btn-open').classList.add('visible')
-  setStatus('✓ Done')
+  setStatus(`✓ Done — ${out.split('/').pop()}`)
 })
 
 window.api.onPipelineError((msg) => {
-  running = false
-  $('btn-run').disabled  = false
-  $('btn-stop').disabled = true
+  jobFinished()
   setStatus(`✕ Error: ${msg}`)
   appendLog(`ERROR: ${msg}`)
 })
 
 window.api.onPipelineAborted(() => {
-  running = false
-  $('btn-run').disabled  = false
-  $('btn-stop').disabled = true
+  jobFinished()
   setStatus('Stopped')
+})
+
+window.api.onJobsUpdate((list) => {
+  const queued = list.filter(j => j.status === 'queued').length
+  $('hw-est').title = queued ? `${queued} job(s) waiting` : ''
+  if (!running && queued) setStatus(`${queued} job(s) queued`)
+})
+
+// ── LAN web access + settings ────────────────────────────────────────────────
+let webState = { enabled: false }
+
+function showWebStatus(st) {
+  webState = st
+  const chip = $('web-chip')
+  chip.classList.toggle('on',  !!(st.enabled && st.urls))
+  chip.classList.toggle('err', !!(st.enabled && st.error))
+  chip.textContent = !st.enabled ? '🌐 Web off'
+                   : st.error    ? '🌐 Web error'
+                   : `🌐 ${(st.urls || [])[0]?.replace('http://', '') || 'Web on'}`
+  chip.title = st.error ? `Web UI failed to start: ${st.error}` : 'LAN web access — click for settings'
+
+  const box = $('web-urls')
+  box.innerHTML = ''
+  if (st.error) box.appendChild(el('div', 'err', `Could not start: ${st.error}`))
+  for (const u of st.urls || []) {
+    const a = el('a', null, u)
+    a.addEventListener('click', () => window.api.openUrl(u))
+    box.appendChild(a)
+  }
+}
+window.api.onWebStatus(showWebStatus)
+
+async function openSettings() {
+  const s = await window.api.loadSettings()
+  $('set-web-enabled').checked = !!s.web?.enabled
+  $('set-web-port').value      = s.web?.port || 8360
+  $('set-web-pin').value       = s.web?.pin || ''
+  $('set-keep-work').checked   = !!s.keepWorkFiles
+  showWebStatus(await window.api.webStatus())
+  $('settings-overlay').classList.remove('hidden')
+}
+$('web-chip').addEventListener('click', openSettings)
+$('btn-settings-cancel').addEventListener('click', () => $('settings-overlay').classList.add('hidden'))
+$('btn-settings-save').addEventListener('click', async () => {
+  const port = parseInt($('set-web-port').value, 10)
+  await window.api.saveSettings({
+    keepWorkFiles: $('set-keep-work').checked,
+    web: {
+      enabled: $('set-web-enabled').checked,
+      port: port >= 1024 && port <= 65535 ? port : 8360,
+      pin: $('set-web-pin').value.trim(),
+    },
+  })
+  $('settings-overlay').classList.add('hidden')
 })
 
 function setStatus(msg) {
@@ -510,6 +577,7 @@ $('btn-setup-start').addEventListener('click', async () => {
 // ── Init ──────────────────────────────────────────────────────────────────────
 ;(async () => {
   await Promise.all([loadHardware(), loadSettings()])
+  showWebStatus(await window.api.webStatus())
   updateRunButton()
   await checkSetup()
 })()

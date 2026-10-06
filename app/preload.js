@@ -29,6 +29,10 @@ contextBridge.exposeInMainWorld('api', {
   runPipeline:  (args) => ipcRenderer.invoke('pipeline:run', args),
   stopPipeline: ()     => ipcRenderer.send('pipeline:stop'),
   openOutput:   (p)    => ipcRenderer.send('shell:open', p),
+  openUrl:      (u)    => ipcRenderer.send('shell:url', u),
+
+  // LAN web UI
+  webStatus:    ()     => ipcRenderer.invoke('web:status'),
 
   // Event subscriptions (return unsubscribe fn)
   onSetupLog:       (fn) => on('setup:log',       fn),
@@ -38,4 +42,7 @@ contextBridge.exposeInMainWorld('api', {
   onPipelineDone:   (fn) => on('pipeline:done',   fn),
   onPipelineError:  (fn) => on('pipeline:error',  fn),
   onPipelineAborted:(fn) => on('pipeline:aborted', fn),
+  onPipelineStarted:(fn) => on('pipeline:started', fn),
+  onJobsUpdate:     (fn) => on('jobs:update',      fn),
+  onWebStatus:      (fn) => on('web:status',       fn),
 })

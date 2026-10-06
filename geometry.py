@@ -61,8 +61,16 @@ def v360_source(mode=None, fps=None):
             "dfisheye", f":ih_fov={fov:.2f}:iv_fov={fov:.2f}")
 
 
-def v360_view(yaw, pitch, h_fov, v_fov, w, h, mode=None):
-    """v360 filter (without input label) for a rectilinear view."""
+def v360_view(yaw, pitch, h_fov, v_fov, w, h, lens=None, mode=None):
+    """v360 filter (without input label) for a rectilinear view.
+    lens=None: sample the stitched dual-fisheye (may cross the seam).
+    lens="front"/"back": sample that single fisheye stream only (no seam)."""
+    mode = mode or video_mode()
+    if mode == "fisheye" and lens in ("front", "back"):
+        fov = lens_fov()
+        local = yaw if lens == "front" else yaw - 180.0   # back lens = 180° turn about the vertical
+        return (f"v360=fisheye:flat:ih_fov={fov:.2f}:iv_fov={fov:.2f}:yaw={norm_yaw(local):.3f}"
+                f":pitch={pitch:.3f}:h_fov={h_fov:.3f}:v_fov={v_fov:.3f}:w={int(w)}:h={int(h)}")
     _, inp, extra = v360_source(mode)
     return (f"v360={inp}:flat{extra}:yaw={norm_yaw(yaw):.3f}:pitch={pitch:.3f}"
             f":h_fov={h_fov:.3f}:v_fov={v_fov:.3f}:w={int(w)}:h={int(h)}")
@@ -71,25 +79,103 @@ def v360_view(yaw, pitch, h_fov, v_fov, w, h, mode=None):
 def views_graph(views, layout="vstack", mode=None, fps=None):
     """
     Build a filter_complex that renders several rectilinear views from ONE
-    decode and stacks them. views = [(yaw, pitch, h_fov, v_fov, w, h), ...].
-    layout: "vstack" | "hstack" | "top_pair" (view 0 on top, views 1 and 2 side
-    by side underneath). Output label: [out].
+    decode and stacks them. views = [(yaw, pitch, h_fov, v_fov, w, h[, lens]), ...]
+    (lens: see v360_view). layout: "vstack" | "hstack" | "top_pair" (view 0 on
+    top, views 1 and 2 side by side underneath). Output label: [out].
     """
-    prefix = v360_source(mode, fps)[0]
+    mode = mode or video_mode()
     n = len(views)
-    parts = [prefix]
-    if n == 1:
-        parts.append(f"[src]{v360_view(*views[0], mode=mode)}[out]")
-        return ";".join(parts)
-    parts.append(f"[src]split={n}" + "".join(f"[s{i}]" for i in range(n)))
-    for i, v in enumerate(views):
-        parts.append(f"[s{i}]{v360_view(*v, mode=mode)}[p{i}]")
-    if layout == "top_pair" and n == 3:
-        parts.append("[p1][p2]hstack=inputs=2[bot]")
-        parts.append("[p0][bot]vstack=inputs=2[out]")
+    lenses = [(v[6] if len(v) > 6 else None) if mode == "fisheye" else None for v in views]
+    pre = f"fps={fps}" if fps else "null"
+    parts = []
+
+    def fan(inp, tag, k):
+        """Feed one input to k consumers; returns their labels."""
+        labs = [f"[{tag}{i}]" for i in range(k)]
+        if k:
+            parts.append(f"{inp}{pre}" + (f",split={k}" if k > 1 else "") + "".join(labs))
+        return labs
+
+    srcs = [None] * n
+    if mode == "equirect":
+        labs = fan("[0:v:0]", "_eq", n)
+        srcs = labs
     else:
-        parts.append("".join(f"[p{i}]" for i in range(n)) + f"{layout}=inputs={n}[out]")
+        n_st = lenses.count(None)
+        fr = fan("[0:v:0]", "_fr", lenses.count("front") + (1 if n_st else 0))
+        bk = fan("[0:v:1]", "_bk", lenses.count("back") + (1 if n_st else 0))
+        st = []
+        if n_st:
+            st = [f"[_st{i}]" for i in range(n_st)]
+            parts.append(f"{bk.pop()}{fr.pop()}hstack=inputs=2" +
+                         (f",split={n_st}" if n_st > 1 else "") + "".join(st))
+        for i, l in enumerate(lenses):
+            srcs[i] = (st if l is None else fr if l == "front" else bk).pop(0)
+
+    for i, v in enumerate(views):
+        parts.append(f"{srcs[i]}{v360_view(*v[:6], lens=lenses[i], mode=mode)}"
+                     + ("[out]" if n == 1 else f"[p{i}]"))
+    if n > 1:
+        if layout == "top_pair" and n == 3:
+            parts.append("[p1][p2]hstack=inputs=2[bot]")
+            parts.append("[p0][bot]vstack=inputs=2[out]")
+        else:
+            parts.append("".join(f"[p{i}]" for i in range(n)) + f"{layout}=inputs={n}[out]")
     return ";".join(parts)
+
+
+# ── Lens seam avoidance ───────────────────────────────────────────────────────
+# The two lenses sit a few cm apart, so a person close to the camera is seen
+# from slightly different positions by each: wherever a crop crosses the stitch
+# seam (yaw ±90°) they appear cut and partly DUPLICATED. No FOV calibration can
+# fix parallax for near subjects, so a pane is cut from ONE lens whenever the
+# face is on one side: each lens sees ~fov/2 (≈95°) from its axis, a few
+# degrees past the seam, and the crop may slide a little away from the seam.
+
+SEAM_MARGIN = 1.5      # degrees kept inside the lens image circle (edge vignetting)
+
+
+def lens_reach(yaw, pitch, h_fov, v_fov, lens):
+    """Largest angle (deg) between the lens axis and any point on the view's border."""
+    X, Y, Z = view_rays(yaw, pitch, h_fov, v_fov, 41, 41)
+    border = np.concatenate([Z[0], Z[-1], Z[:, 0], Z[:, -1]])
+    if lens == "back":
+        border = -border
+    return float(np.degrees(np.arccos(np.clip(border, -1, 1))).max())
+
+
+def fit_single_lens(yaw, pitch, h_fov, v_fov, face_yaw, face_pitch, face_deg, spread=0.0, mode=None):
+    """
+    (yaw, pitch, h_fov, v_fov, lens) for a pane aimed at a face at
+    (face_yaw, face_pitch). lens is "front"/"back" when the whole pane fits in
+    that one lens: first by sliding the pane away from the seam (the face stays
+    inside the middle 90% of the frame), then by also zooming in, up to 40% —
+    a tighter close-up beats a duplicated strip.
+    Otherwise lens=None and the pane is cut from the stitched view (face
+    sitting right on the seam).
+    """
+    if (mode or video_mode()) != "fisheye":
+        return yaw, pitch, h_fov, v_fov, None
+    lens = "front" if abs(norm_yaw(face_yaw)) < 90.0 else "back"
+    limit = lens_fov() / 2.0 - SEAM_MARGIN
+    axis = 0.0 if lens == "front" else 180.0
+    step = -0.25 if norm_yaw(yaw - axis) > 0 else 0.25
+    # where the face sits vertically, as a fraction of the half-frame
+    t_v = math.tan(math.radians(v_fov / 2))
+    k = math.tan(math.radians(face_pitch - pitch)) / t_v if t_v else 0.0
+    for zoom in (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6):
+        hf = 2 * math.degrees(math.atan(math.tan(math.radians(h_fov / 2)) * zoom))
+        vf = 2 * math.degrees(math.atan(t_v * zoom))
+        p = face_pitch - math.degrees(math.atan(k * math.tan(math.radians(vf / 2))))
+        max_shift = 0.45 * hf - face_deg / 2.0 - spread / 2.0
+        shift = 0.0
+        while True:
+            if lens_reach(yaw + shift, p, hf, vf, lens) <= limit:
+                return norm_yaw(yaw + shift), p, hf, vf, lens
+            if abs(shift) + 0.25 > max_shift:
+                break
+            shift += step
+    return yaw, pitch, h_fov, v_fov, None
 
 
 # ── Python side (frame analysis) ──────────────────────────────────────────────

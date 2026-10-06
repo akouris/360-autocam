@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>360 AutoCam</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header>
+  <span class="brand">360 AutoCam</span>
+  <span id="busy" class="chip"></span>
+</header>
+
+<main id="main" class="hidden">
+
+  <section class="card" id="new-job">
+    <h2>New render</h2>
+
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="browse">Browse this Mac</button>
+      <button class="tab" data-tab="upload">Upload</button>
+    </div>
+
+    <!-- Browse files on the render Mac (home folder + mounted network drives) -->
+    <div id="tab-browse" class="tab-body">
+      <div id="crumbs"></div>
+      <ul id="listing"></ul>
+      <p class="hint">Click a video to use it. Click an audio file to add it as the external mic track.
+         Network shares appear under “Network &amp; external drives” once they are mounted on the render Mac.</p>
+    </div>
+
+    <!-- Upload from this computer -->
+    <div id="tab-upload" class="tab-body hidden">
+      <label class="pick">
+        <span>360° video</span>
+        <input type="file" id="up-video" accept=".insv,.mp4,.mov" />
+      </label>
+      <label class="pick">
+        <span>External mic audio <em>(optional)</em></span>
+        <input type="file" id="up-audio" accept=".mp3,.wav,.m4a,.aac" />
+      </label>
+      <p class="hint warn">Uploads copy the whole file over the network: an 8K session can be tens of GB
+         and take a long time. If the file is already on a shared drive, use “Browse this Mac” instead.
+         Keep this page open until the upload finishes.</p>
+      <div id="up-progress" class="hidden">
+        <div class="bar"><div id="up-fill"></div></div>
+        <div id="up-label"></div>
+      </div>
+    </div>
+
+    <div class="selection">
+      <div><span class="k">Video</span> <span id="sel-video" class="v">none selected</span></div>
+      <div><span class="k">Mic</span> <span id="sel-audio" class="v">none</span>
+           <button id="clear-audio" class="link hidden">remove</button></div>
+    </div>
+
+    <div class="options">
+      <div class="seg" id="mode">
+        <button class="active" data-mode="fisheye">Insta360</button>
+        <button data-mode="equirect">YouTube 360°</button>
+      </div>
+      <label class="check"><input type="checkbox" id="preview" /> 60s preview</label>
+      <button id="go" class="btn primary" disabled>Render</button>
+    </div>
+    <div id="msg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>Queue</h2>
+    <ul id="jobs"><li class="empty">No jobs yet</li></ul>
+  </section>
+
+</main>
+
+<!-- PIN gate -->
+<div id="login" class="hidden">
+  <form id="login-form" class="card">
+    <h2>360 AutoCam</h2>
+    <p class="hint">Enter the access PIN set in the desktop app.</p>
+    <input type="password" id="pin" inputmode="numeric" autocomplete="current-password" autofocus />
+    <button class="btn primary" type="submit">Continue</button>
+    <div id="login-msg" class="msg"></div>
+  </form>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -18,6 +18,7 @@
       <span class="hw-chip" id="hw-ram">—</span>
       <span class="hw-chip good" id="hw-vt">VideoToolbox ✓</span>
       <span class="hw-chip" id="hw-est">—</span>
+      <button class="hw-chip web-chip" id="web-chip" title="LAN web access — click for settings">🌐 …</button>
     </div>
   </div>
 
@@ -111,6 +112,33 @@
     <div id="resume-actions">
       <button class="btn btn-danger"   id="btn-resume-fresh">↺ Start Fresh (all steps)</button>
       <button class="btn btn-primary"  id="btn-resume-now">▶ Resume Now</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Settings overlay (web access + cleanup) ─────────────────────────── -->
+<div id="settings-overlay" class="hidden">
+  <div id="settings-card">
+    <h2>Settings</h2>
+
+    <div class="set-section">Web access (local network)</div>
+    <label class="set-row"><input type="checkbox" id="set-web-enabled"> Serve the web UI on this Mac's network</label>
+    <div id="web-urls"></div>
+    <div class="set-grid">
+      <label>Port <input type="number" id="set-web-port" min="1024" max="65535"></label>
+      <label>Access PIN <input type="text" id="set-web-pin" placeholder="none — anyone on the LAN" autocomplete="off" spellcheck="false"></label>
+    </div>
+    <div class="set-hint">Web users can browse your home folder and mounted network drives (/Volumes), upload files,
+      and queue renders. Jobs run one at a time, shared with this window. Closing this window keeps the web UI running; quit with ⌘Q.</div>
+
+    <div class="set-section">After a successful render</div>
+    <label class="set-row"><input type="checkbox" id="set-keep-work"> Keep working files (frames, audio, analysis) for debugging</label>
+    <div class="set-hint">Normally only the finished video is kept: <code>&lt;name&gt;_autocam.mp4</code> next to the source
+      (or in Movies/360 AutoCam if that folder is read-only). Unfinished jobs keep their working files so they can resume.</div>
+
+    <div id="settings-actions">
+      <button class="btn btn-secondary" id="btn-settings-cancel">Cancel</button>
+      <button class="btn btn-primary"   id="btn-settings-save">Save</button>
     </div>
   </div>
 </div>

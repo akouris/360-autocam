@@ -94,6 +94,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "webserver.js",
+      "web/**",
       "renderer/**"
     ],
     "afterPack": "build/adhoc-sign.js"

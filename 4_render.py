@@ -24,8 +24,11 @@ static single shot — even if mapping is wrong (see emit_gap_carousel).
 Framing: every pane is aimed at the face's actual position during that shot
 (data/framing_tracks.json, 1 Hz from the mouth-tracking pass; falls back to
 data/face_tracks.json), zoomed by face size, with the face in the upper part
-of the frame (geometry.frame_view). Panes are cut from the stitched 360° view,
-so people sitting on the lens seam frame correctly.
+of the frame (geometry.frame_view). Each pane is cut from the single lens that
+faces the person (geometry.fit_single_lens), sliding a few degrees off the
+stitch seam if needed: a crop across the seam shows near subjects cut and
+duplicated (lens parallax). Only a face sitting right on the seam uses the
+stitched view.
 
 Encoding: VideoToolbox HEVC; video-only segments concatenated, then ONE
 continuous audio track laid over the whole video (no per-cut audio glitches);
@@ -164,7 +167,9 @@ class Framer:
         for s, (w, h) in zip(seats, PANES[len(seats)]):
             yaw, pitch, size, spread = self.face_at(s, t0, t1)
             cy, cp, hf, vf = geometry.frame_view(yaw, pitch, size, w, h, spread)
-            out.append((cy, cp, hf, vf, w, h))
+            # cut from one lens when possible: crossing the seam duplicates people
+            cy, cp, hf, vf, lens = geometry.fit_single_lens(cy, cp, hf, vf, yaw, pitch, size, spread)
+            out.append((cy, cp, hf, vf, w, h, lens))
         return out
 
 
@@ -648,6 +653,11 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
                 views[j] = prev[0]
             held[key] = (views[j], shot["end"])
         shot_views.append(views)
+    panes = [v for vs in shot_views for v in vs]
+    on_seam = sum(1 for v in panes if len(v) > 6 and v[6] is None)
+    if geometry.video_mode() == "fisheye" and panes:
+        print(f"Lens seam: {len(panes) - on_seam}/{len(panes)} panes cut from a single lens"
+              + (f", {on_seam} sit on the seam (stitched)" if on_seam else ""), flush=True)
 
     def job(i, shot):
         out = os.path.join(segments_dir, f"seg_{i:05d}.mp4")
@@ -655,7 +665,8 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
         return i, out
 
     clips_map, done = {}, 0
-    with ThreadPoolExecutor(max_workers=N_RENDER_WORKERS) as pool:
+    pool = ThreadPoolExecutor(max_workers=N_RENDER_WORKERS)
+    try:
         futures = {pool.submit(job, i, shot): i for i, shot in enumerate(timeline)}
         for fut in as_completed(futures):
             try:
@@ -667,6 +678,9 @@ def _render_inner(video_path, output_path, end_time, external_audio, segments_di
             clips_map[i] = out
             done += 1
             print(f"[{done}/{len(timeline)}]", flush=True)
+    finally:
+        # on an error or Stop, drop the queued shots instead of encoding them all
+        pool.shutdown(wait=True, cancel_futures=True)
 
     clips = [clips_map[i] for i in range(len(timeline))]
     print(f"\nConcatenating {len(clips)} clips...")
@@ -708,5 +722,9 @@ if __name__ == "__main__":
                         help="Aligned external mic WAV to use instead of camera audio "
                              "(auto-detected from data/external_audio_aligned.wav if present)")
     args = parser.parse_args()
+    # Stop in the app sends SIGTERM: turn it into SystemExit so render()'s
+    # finally-block still removes the temp segment folder
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     render(args.video_path, args.output_path,
            end_time=args.end_time, external_audio=args.external_audio)

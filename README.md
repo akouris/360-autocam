@@ -37,7 +37,18 @@ npm install
 npm start
 ```
 
-In development (`npm start`) the app uses `app/bundle` if you've built it, otherwise the project `venv`. Output lands in `autocam_<videoname>/` next to your input file.
+In development (`npm start`) the app uses `app/bundle` if you've built it, otherwise the project `venv`.
+
+**Output & cleanup.** The finished video is saved as `<videoname>_autocam.mp4` next to the input (or in `~/Movies/360 AutoCam/` if that folder is read-only; a re-run never overwrites, it adds ` (2)`). Working files (audio, frames, analysis) live in `~/Library/Caches/360 AutoCam/jobs/` and are deleted after a successful run. An interrupted or failed job keeps them, so the next run resumes; leftovers older than 7 days are pruned at launch. A 60s preview keeps them too, so the full render reuses the analysis. *Settings → Keep working files* turns cleanup off for debugging.
+
+### Web UI on the local network
+
+While the app is open it also serves a web UI. The address is shown in the 🌐 chip in the title bar (e.g. `http://macultra.local:8360`); click the chip for settings (on/off, port, optional access PIN). From any browser on the LAN you can:
+
+- **Browse this Mac**: pick a video (and optional mic audio) from the render Mac's home folder or any mounted drive/share under `/Volumes`. Nothing is copied, so this is the way to go for big files: mount the NAS share on the render Mac once (Finder → ⌘K) and it shows up here.
+- **Upload**: stream a file from your own computer. The file goes straight to disk (`~/Movies/360 AutoCam/Uploads/`), free space is checked first, and the upload is deleted after a successful render. Results go to `~/Movies/360 AutoCam/`.
+
+Jobs from the window and the web share one queue and run one at a time. The page shows live progress and a **Download** button when a job is done. While a job runs, the Mac is kept from sleeping. Closing the window keeps the web UI running; quit with ⌘Q. On first launch, macOS asks whether to allow incoming connections: click Allow. Ad-hoc signed builds may ask again after an update.
 
 ### Building the self-contained app (for other Macs)
 
